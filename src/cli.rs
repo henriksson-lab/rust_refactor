@@ -21,6 +21,35 @@ pub enum Command {
     ToOop(ToOopCommand),
     ToOopStats(ToOopStatsCommand),
     RemoveFunction(RemoveFunctionCommand),
+    SimplifyWrapper(SimplifyWrapperCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SimplifyWrapperCommand {
+    /// Rust source file containing the free function, relative to the workspace.
+    #[arg(long)]
+    pub file: Utf8PathBuf,
+    /// One-based line of the function name.
+    #[arg(long)]
+    pub line: usize,
+    /// One-based column of the function name.
+    #[arg(long)]
+    pub column: usize,
+    /// Validate and print edits without changing source files.
+    #[arg(long, conflicts_with = "write")]
+    pub dry_run: bool,
+    /// Apply edits and run cargo check; restore edited files on failure.
+    #[arg(long)]
+    pub write: bool,
+    /// Scan source without rust-analyzer; requires a unique function name in the workspace.
+    #[arg(long)]
+    pub fast: bool,
+    /// Cargo manifest path for the workspace.
+    #[arg(long)]
+    pub manifest_path: Option<Utf8PathBuf>,
+    /// Output format for the result and diagnostics.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]

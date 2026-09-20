@@ -329,7 +329,7 @@ fn run_inner(
     Ok(("applied", plan, target))
 }
 
-fn line_col_offset(source: &str, line: usize, column: usize) -> Option<usize> {
+pub(crate) fn line_col_offset(source: &str, line: usize, column: usize) -> Option<usize> {
     let start = source
         .split_inclusive('\n')
         .take(line.checked_sub(1)?)
@@ -344,7 +344,7 @@ fn line_col_offset(source: &str, line: usize, column: usize) -> Option<usize> {
     Some(start + offset)
 }
 
-fn range_json(range: TextRange) -> Value {
+pub(crate) fn range_json(range: TextRange) -> Value {
     json!({"start":u32::from(range.start()),"end":u32::from(range.end())})
 }
 

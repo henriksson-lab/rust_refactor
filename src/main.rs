@@ -15,5 +15,9 @@ fn main() -> Result<()> {
             let code = rust_refactor::refactors::remove_function::run(command)?;
             std::process::exit(code);
         }
+        Command::SimplifyWrapper(command) => {
+            let code = rust_refactor::refactors::simplify_wrapper::run(command)?;
+            std::process::exit(code);
+        }
     }
 }

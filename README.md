@@ -6,8 +6,9 @@ The benefit of using this tool over "raw" LLM is that
 * Synchronized edits will be made across files, informed by static analysis - More precise and avoids LLMs not wanting to make "breaking edits"
 * Less token usage because the tool is tailored for the purpose
 
-The CLI has four subcommands: `inline`, `to-oop`, `to-oop-stats`, and
-`remove-function`. Run `rust-refactor <command> --help` for all options.
+The CLI has five subcommands: `inline`, `to-oop`, `to-oop-stats`,
+`remove-function`, and `simplify-wrapper`. Run `rust-refactor <command> --help`
+for all options.
 
 
 ## Command: Inline annotated functions
@@ -155,3 +156,25 @@ their original contents. The command refuses calls whose result is used,
 function pointers/callbacks, and references it cannot remove. It also refuses
 names shared by multiple workspace functions. These limits prevent a partial
 deletion; the JSON `diagnostics` field explains a refusal.
+
+## Command: Remove a transparent drop wrapper
+
+`simplify-wrapper` recognizes a selected free function whose only operation
+is `drop` on its single owned parameter. It replaces resolved calls with
+`::core::mem::drop(argument)`, removes simple imports, and deletes the wrapper.
+Selection is by source position; the function's name does not determine whether
+it matches. Other wrapper shapes are currently refused. For large workspaces,
+`--fast` scans source without loading rust-analyzer; it requires the selected
+name to be unique among workspace functions.
+
+```sh
+./target/debug/rust-refactor simplify-wrapper \
+  --manifest-path /path/to/Cargo.toml \
+  --file src/lib.rs --line 42 --column 8 --dry-run --format json
+```
+
+Review the JSON plan, then replace `--dry-run` with `--write`. A write formats
+touched files and runs `cargo check`, restoring those files if verification
+fails. Function-value references and calls the tool cannot rewrite cause a
+refusal with exit code 3. Unqualified `drop` must resolve to the standard
+function or be unshadowed in the defining source file.

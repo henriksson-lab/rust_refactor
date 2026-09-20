@@ -123,18 +123,40 @@ pub(crate) fn parse_project_files(project: &Project) -> Result<Vec<ParsedFile>> 
     project
         .rust_files
         .iter()
-        .map(|path| {
-            let source = fs::read_to_string(path)
-                .with_context(|| format!("failed to read Rust source file {path}"))?;
-            let parsed = SourceFile::parse(&source, Edition::CURRENT);
+        .map(|path| parse_source_file(path))
+        .collect()
+}
 
-            Ok(ParsedFile {
-                path: path.clone(),
-                source,
-                tree: parsed.tree(),
-            })
+pub(crate) fn parse_source_file(path: &Utf8PathBuf) -> Result<ParsedFile> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Rust source file {path}"))?;
+    Ok(parsed_source(path.clone(), source))
+}
+
+pub(crate) fn parse_project_files_matching(
+    project: &Project,
+    name: &str,
+) -> Result<Vec<ParsedFile>> {
+    project
+        .rust_files
+        .iter()
+        .filter_map(|path| {
+            let source = match fs::read_to_string(path)
+                .with_context(|| format!("failed to read Rust source file {path}"))
+            {
+                Ok(source) => source,
+                Err(error) => return Some(Err(error)),
+            };
+            source
+                .contains(name)
+                .then(|| Ok(parsed_source(path.clone(), source)))
         })
         .collect()
+}
+
+fn parsed_source(path: Utf8PathBuf, source: String) -> ParsedFile {
+    let tree = SourceFile::parse(&source, Edition::CURRENT).tree();
+    ParsedFile { path, source, tree }
 }
 
 fn discover_inline_functions(files: &[ParsedFile]) -> Vec<InlineFunction> {
