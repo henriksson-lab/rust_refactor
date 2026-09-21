@@ -5,6 +5,24 @@ fn main() -> Result<()> {
     let cli = Cli::parse_args();
 
     match cli.command {
+        Command::ConstantsToEnum(command) => {
+            let code = rust_refactor::refactors::constants_to_enum::run(command)?;
+            std::process::exit(code);
+        }
+        Command::ConstantsToEnumCsv(command) => {
+            let code = rust_refactor::refactors::constants_to_enum_csv::run(command)?;
+            std::process::exit(code);
+        }
+        Command::ConstantsToEnumStats(command) => {
+            rust_refactor::refactors::constants_to_enum_stats::run(command)
+        }
+        Command::EnumHoist(command) => {
+            let code = rust_refactor::refactors::enum_hoist::run(command)?;
+            std::process::exit(code);
+        }
+        Command::EnumHoistStats(command) => {
+            rust_refactor::refactors::enum_hoist::run_stats(command)
+        }
         Command::Inline(command) => rust_refactor::refactors::inline_function::run(command),
         Command::ToOop(command) => {
             let code = rust_refactor::refactors::to_oop::run(command)?;

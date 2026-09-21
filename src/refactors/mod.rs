@@ -1,3 +1,7 @@
+pub mod constants_to_enum;
+pub mod constants_to_enum_csv;
+pub mod constants_to_enum_stats;
+pub mod enum_hoist;
 pub mod inline_function;
 pub mod oop_stats;
 pub mod remove_function;
