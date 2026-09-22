@@ -121,11 +121,51 @@ pub fn analyze_inline_functions(project: &Project) -> Result<InlineAnalysis> {
 }
 
 pub(crate) fn parse_project_files(project: &Project) -> Result<Vec<ParsedFile>> {
-    project
-        .rust_files
-        .iter()
-        .map(|path| parse_source_file(path))
-        .collect()
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(16)
+        .min(project.rust_files.len());
+    if worker_count <= 1 {
+        return project.rust_files.iter().map(parse_source_file).collect();
+    }
+
+    // Parsing dominates the discovery commands on translation workspaces with
+    // thousands of independent source files. Keep the sorted input in chunks;
+    // joining handles in spawn order preserves deterministic report ordering.
+    let chunk_size = project.rust_files.len().div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        let handles = project
+            .rust_files
+            .chunks(chunk_size)
+            .map(|paths| {
+                scope.spawn(move || {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            let source = fs::read_to_string(path).with_context(|| {
+                                format!("failed to read Rust source file {path}")
+                            })?;
+                            let parse = SourceFile::parse(&source, Edition::CURRENT);
+                            Ok((path.clone(), source, parse))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut files = Vec::with_capacity(project.rust_files.len());
+        for handle in handles {
+            let parsed = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("a Rust source parsing worker panicked"))??;
+            files.extend(parsed.into_iter().map(|(path, source, parse)| ParsedFile {
+                path,
+                source,
+                tree: parse.tree(),
+            }));
+        }
+        Ok(files)
+    })
 }
 
 pub(crate) fn parse_source_file(path: &Utf8PathBuf) -> Result<ParsedFile> {

@@ -4,6 +4,8 @@ pub mod constants_to_enum_stats;
 pub mod enum_hoist;
 pub mod inline_function;
 pub mod oop_stats;
+pub mod out_param_stats;
 pub mod remove_function;
+pub mod return_stats;
 pub mod simplify_wrapper;
 pub mod to_oop;

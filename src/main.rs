@@ -24,6 +24,7 @@ fn main() -> Result<()> {
             rust_refactor::refactors::enum_hoist::run_stats(command)
         }
         Command::Inline(command) => rust_refactor::refactors::inline_function::run(command),
+        Command::OutParamStats(command) => rust_refactor::refactors::out_param_stats::run(command),
         Command::ToOop(command) => {
             let code = rust_refactor::refactors::to_oop::run(command)?;
             std::process::exit(code);
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
             let code = rust_refactor::refactors::remove_function::run(command)?;
             std::process::exit(code);
         }
+        Command::ReturnStats(command) => rust_refactor::refactors::return_stats::run(command),
         Command::SimplifyWrapper(command) => {
             let code = rust_refactor::refactors::simplify_wrapper::run(command)?;
             std::process::exit(code);

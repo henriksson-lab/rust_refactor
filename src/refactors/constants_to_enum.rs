@@ -69,6 +69,7 @@ struct SelectedConst {
     name_range: TextRange,
     value_range: TextRange,
     visibility: String,
+    workspace_unique: bool,
 }
 
 pub fn run(command: ConstantsToEnumCommand) -> Result<i32> {
@@ -156,6 +157,11 @@ fn run_inner(
             .descendants()
             .filter_map(ast::Const::cast)
             .filter(|item| {
+                item.syntax()
+                    .parent()
+                    .is_some_and(|parent| ast::SourceFile::cast(parent).is_some())
+            })
+            .filter(|item| {
                 item.name()
                     .is_some_and(|candidate| candidate.text() == name)
             })
@@ -230,6 +236,7 @@ fn run_inner(
             name_range: item.name().unwrap().syntax().text_range(),
             value_range: value_expr.syntax().text_range(),
             visibility,
+            workspace_unique: false,
         });
     }
     constants.sort_by_key(|item| item.item_range.start());
@@ -293,7 +300,7 @@ fn run_inner(
         });
     }
 
-    let needs_semantic = command
+    let crosses_files = command
         .matches
         .iter()
         .chain(&command.comparisons)
@@ -303,6 +310,34 @@ fn run_inner(
                 needed || resolve_file(&project, &Utf8PathBuf::from(path))? != definition_file,
             )
         })?;
+    if crosses_files {
+        let selected_names = constants
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut definition_counts = BTreeMap::<String, usize>::new();
+        for file in analysis::parse_project_files(&project)? {
+            for item in file
+                .tree
+                .syntax()
+                .descendants()
+                .filter_map(ast::Const::cast)
+            {
+                if let Some(name) = item
+                    .name()
+                    .filter(|name| selected_names.contains(name.text().as_str()))
+                {
+                    *definition_counts
+                        .entry(name.text().to_string())
+                        .or_default() += 1;
+                }
+            }
+        }
+        for item in &mut constants {
+            item.workspace_unique = definition_counts.get(&item.name) == Some(&1);
+        }
+    }
+    let needs_semantic = crosses_files && constants.iter().any(|item| !item.workspace_unique);
     let semantic = needs_semantic
         .then(|| {
             SemanticProject::load_with(&project, command.all_features, command.target.as_deref())
@@ -704,6 +739,12 @@ fn resolve_selected_constant<'a>(
 ) -> std::result::Result<Option<&'a SelectedConst>, FlowError> {
     if constants.first().is_some_and(|item| &item.file == file) {
         return Ok(constants.iter().find(|item| item.name == name));
+    }
+    if let Some(item) = constants
+        .iter()
+        .find(|item| item.name == name && item.workspace_unique)
+    {
+        return Ok(Some(item));
     }
     let Some(semantic) = semantic else {
         return Ok(None);

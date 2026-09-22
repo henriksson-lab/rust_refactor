@@ -720,6 +720,7 @@ fn run_inner(
     let originals = snapshot(&plan)?;
     let result = (|| -> Result<()> {
         apply_plan(&plan)?;
+        strip_trailing_whitespace(originals.keys())?;
         verify::run_rustfmt_files(&project.manifest_path, &originals.keys().cloned().collect())?;
         verify::run_cargo_check(verify::CargoVerification {
             manifest_path: Some(&project.manifest_path),
@@ -734,6 +735,61 @@ fn run_inner(
         ));
     }
     Ok(("applied", plan, target))
+}
+
+fn strip_trailing_whitespace<'a>(files: impl Iterator<Item = &'a Utf8PathBuf>) -> Result<()> {
+    for file in files {
+        let source = fs::read_to_string(file)?;
+        let parsed = SourceFile::parse(&source, Edition::CURRENT);
+        let mut empty_imports = parsed
+            .tree()
+            .syntax()
+            .descendants()
+            .filter_map(ast::Use::cast)
+            .filter(|item| {
+                item.use_tree()
+                    .and_then(|tree| tree.use_tree_list())
+                    .is_some_and(|list| list.use_trees().next().is_none())
+            })
+            .map(|item| item.syntax().text_range())
+            .collect::<Vec<_>>();
+        empty_imports.sort_by_key(|range| range.start());
+        let mut source_without_empty_imports = source.clone();
+        for range in empty_imports.into_iter().rev() {
+            let bytes = source_without_empty_imports.as_bytes();
+            let mut start = usize::from(range.start());
+            let mut end = usize::from(range.end());
+            let line_start = bytes[..start]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            let line_end = bytes[end..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| end + offset + 1);
+            if bytes[line_start..start].iter().all(u8::is_ascii_whitespace)
+                && bytes[end..line_end].iter().all(u8::is_ascii_whitespace)
+            {
+                start = line_start;
+                end = line_end;
+            }
+            source_without_empty_imports.replace_range(start..end, "");
+        }
+        let mut updated = String::with_capacity(source.len());
+        for line in source_without_empty_imports.split_inclusive('\n') {
+            let (content, ending) = line
+                .strip_suffix("\r\n")
+                .map(|content| (content, "\r\n"))
+                .or_else(|| line.strip_suffix('\n').map(|content| (content, "\n")))
+                .unwrap_or((line, ""));
+            updated.push_str(content.trim_end());
+            updated.push_str(ending);
+        }
+        if updated != source {
+            fs::write(file, updated)?;
+        }
+    }
+    Ok(())
 }
 
 fn report_timing(label: &str, started: Instant) {
@@ -774,6 +830,23 @@ fn collect_reference_index(files: &[ParsedFile]) -> ReferenceIndex {
                     file: file.path.clone(),
                     range: name.syntax().text_range(),
                 });
+        }
+        for pattern in file.tree.syntax().descendants().filter_map(ast::Pat::cast) {
+            for token in pattern
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter(|token| token.kind() == SyntaxKind::IDENT)
+            {
+                index
+                    .by_name
+                    .entry(token.text().to_owned())
+                    .or_default()
+                    .push(SemanticReference {
+                        file: file.path.clone(),
+                        range: token.text_range(),
+                    });
+            }
         }
         for call in file
             .tree
@@ -823,10 +896,17 @@ fn remove_compatibility_aliases(
     let imports = analysis::collect_import_sites(files);
     let mut definition_counts = BTreeMap::<String, usize>::new();
     for file in files {
-        for name in file.tree.syntax().descendants().filter_map(ast::Name::cast) {
-            *definition_counts
-                .entry(name.text().to_string())
-                .or_default() += 1;
+        for item in file
+            .tree
+            .syntax()
+            .descendants()
+            .filter_map(ast::Const::cast)
+        {
+            if let Some(name) = item.name() {
+                *definition_counts
+                    .entry(name.text().to_string())
+                    .or_default() += 1;
+            }
         }
     }
     let mut removed_items = BTreeSet::new();
@@ -845,11 +925,54 @@ fn remove_compatibility_aliases(
             let item = ancestor_at::<ast::Const>(parsed, name_range)
                 .ok_or_else(|| anyhow!("enum compatibility alias is not a const item"))?;
             let item_range = item.syntax().text_range();
-            let alias_references = if definition_counts.get(&name) == Some(&1) {
+            let mut alias_references = if definition_counts.get(&name) == Some(&1) {
                 references.by_name.get(&name).cloned().unwrap_or_default()
             } else {
                 indexed_references(references, semantic, &definition.file, name_range, &name)?
             };
+            if definition_counts.get(&name) != Some(&1) {
+                let mut macro_files = BTreeSet::from([definition.file.clone()]);
+                for reference in &alias_references {
+                    if imports.iter().any(|import| {
+                        import.file == reference.file
+                            && import.function_name == name
+                            && import.name_range == reference.range
+                    }) {
+                        macro_files.insert(reference.file.clone());
+                    }
+                }
+                for candidate in references.by_name.get(&name).into_iter().flatten() {
+                    if !macro_files.contains(&candidate.file)
+                        || alias_references.contains(candidate)
+                        || file_map.get(&candidate.file).is_none_or(|parsed| {
+                            !is_matches_macro_reference(parsed, candidate.range)
+                                || parsed
+                                    .tree
+                                    .syntax()
+                                    .descendants()
+                                    .filter_map(ast::Const::cast)
+                                    .filter_map(|item| item.name())
+                                    .any(|candidate_name| {
+                                        candidate_name.text() == name
+                                            && !(candidate.file == definition.file
+                                                && candidate_name.syntax().text_range()
+                                                    == name_range)
+                                    })
+                        })
+                    {
+                        continue;
+                    }
+                    alias_references.push(candidate.clone());
+                }
+                alias_references.sort_by_key(|reference| {
+                    (
+                        reference.file.clone(),
+                        reference.range.start(),
+                        reference.range.end(),
+                    )
+                });
+                alias_references.dedup();
+            }
             for reference in alias_references {
                 if reference.file == definition.file && item_range.contains_range(reference.range) {
                     continue;
@@ -873,11 +996,30 @@ fn remove_compatibility_aliases(
                     }
                     continue;
                 }
-                builder.add(
-                    &reference.file,
-                    reference.range,
-                    format!("{}::{variant}.to_raw()", info.path),
-                )?;
+                let parsed_reference = file_map
+                    .get(&reference.file)
+                    .ok_or_else(|| anyhow!("alias reference file was not parsed"))?;
+                let in_pattern = ancestor_at::<ast::Pat>(parsed_reference, reference.range)
+                    .is_some()
+                    || is_matches_macro_reference(parsed_reference, reference.range);
+                let replacement = if in_pattern {
+                    info.values
+                        .iter()
+                        .find_map(|(value, candidate)| (candidate == variant).then_some(*value))
+                        .ok_or_else(|| anyhow!("enum alias variant has no integer value"))?
+                        .to_string()
+                } else {
+                    format!("{}::{variant}.to_raw()", info.path)
+                };
+                let replacement_range =
+                    ancestor_at::<ast::PathExpr>(parsed_reference, reference.range)
+                        .map(|path| path.syntax().text_range())
+                        .or_else(|| {
+                            ancestor_at::<ast::PathPat>(parsed_reference, reference.range)
+                                .map(|path| path.syntax().text_range())
+                        })
+                        .unwrap_or(reference.range);
+                builder.add(&reference.file, replacement_range, replacement)?;
             }
             if removed_items.insert((
                 definition.file.clone(),
@@ -903,7 +1045,41 @@ fn remove_compatibility_aliases(
         merged_import_deletions.push((file, range));
     }
     for (file, range) in merged_import_deletions {
-        builder.add(&file, range, "")?;
+        let parsed = file_map
+            .get(&file)
+            .ok_or_else(|| anyhow!("import file was not parsed"))?;
+        let bytes = parsed.source.as_bytes();
+        let mut start = usize::from(range.start());
+        let mut end = usize::from(range.end());
+        let line_start = bytes[..start]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line_end = bytes[end..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| end + offset + 1);
+        let content_end = if line_end > 0 && bytes.get(line_end - 1) == Some(&b'\n') {
+            line_end - 1
+        } else {
+            line_end
+        };
+        if bytes[line_start..start].iter().all(u8::is_ascii_whitespace)
+            && bytes[end..content_end].iter().all(u8::is_ascii_whitespace)
+        {
+            start = line_start;
+            end = line_end;
+        } else if bytes[end..content_end].iter().all(u8::is_ascii_whitespace) {
+            end = content_end;
+        }
+        builder.add(
+            &file,
+            TextRange::new(
+                TextSize::try_from(start).unwrap(),
+                TextSize::try_from(end).unwrap(),
+            ),
+            "",
+        )?;
     }
     if removed_items.is_empty() {
         return refuse(
@@ -3245,6 +3421,16 @@ fn record_field_name_ref(field: &ast::RecordExprField) -> Option<ast::NameRef> {
 fn ancestor_at<N: AstNode>(file: &ParsedFile, range: TextRange) -> Option<N> {
     ancestors_at::<N>(file, range).into_iter().next()
 }
+
+fn is_matches_macro_reference(file: &ParsedFile, range: TextRange) -> bool {
+    ancestors_at::<ast::MacroCall>(file, range)
+        .into_iter()
+        .any(|call| {
+            call.path()
+                .is_some_and(|path| path.syntax().text().to_string().trim_end() == "matches")
+        })
+}
+
 fn ancestors_at<N: AstNode>(file: &ParsedFile, range: TextRange) -> Vec<N> {
     let token = file
         .tree

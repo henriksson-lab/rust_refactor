@@ -85,6 +85,42 @@ fn introduces_enum_and_converts_selected_match() {
 }
 
 #[test]
+fn ignores_a_function_local_constant_that_shadows_a_selected_module_constant() {
+    let source = SOURCE.replace(
+        "pub fn width(raw: i32) -> usize {",
+        "pub fn width(raw: i32) -> usize {\n    const SLICE_MODE_BYTE: i32 = 9;",
+    );
+    let project = fixture(&source);
+    let mut command = Command::cargo_bin("rust-refactor").unwrap();
+    let output = command
+        .args([
+            "constants-to-enum",
+            "--manifest-path",
+            project.path().join("Cargo.toml").to_str().unwrap(),
+            "--file",
+            "src/lib.rs",
+            "--enum-name",
+            "SliceMode",
+            "--constant",
+            "SLICE_MODE_BYTE=Byte",
+            "--constant",
+            "SLICE_MODE_SHORT=Short",
+            "--constant",
+            "SLICE_MODE_FLOAT=Float",
+            "--match",
+            "src/lib.rs:7:5",
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{result:#}");
+    assert_eq!(result["status"], "planned");
+}
+
+#[test]
 fn refuses_literal_pattern_in_selected_match() {
     let project = fixture(&SOURCE.replace("SLICE_MODE_SHORT => 2", "1 => 2"));
     let (status, result) = run(&project, "--dry-run", &[]);

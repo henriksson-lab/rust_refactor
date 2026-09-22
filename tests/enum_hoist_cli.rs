@@ -109,6 +109,16 @@ fn removes_compatibility_aliases_and_inlines_remaining_raw_uses() {
 pub fn raw_mode(fast: bool) -> i32 {
     if fast { MODE_FAST } else { MODE_SLOW }
 }
+pub fn is_fast(raw: i32) -> bool {
+    match raw { MODE_FAST => true, MODE_SLOW => false, _ => false }
+}
+pub fn is_known(raw: i32) -> bool {
+    matches!(raw, MODE_FAST | MODE_SLOW)
+}
+pub fn with_local_import(fast: bool) -> i32 {
+    use crate::{MODE_FAST, MODE_SLOW};
+    if fast { MODE_FAST } else { MODE_SLOW }
+}
 "#,
     );
     let result = run_alias_cleanup(&project);
@@ -118,6 +128,10 @@ pub fn raw_mode(fast: bool) -> i32 {
     assert!(!output.contains("pub const MODE_"), "{output}");
     assert!(output.contains("Mode::Fast.to_raw()"), "{output}");
     assert!(output.contains("Mode::Slow.to_raw()"), "{output}");
+    assert!(output.contains("match raw"), "{output}");
+    assert!(output.contains("1 => true"), "{output}");
+    assert!(output.contains("0 => false"), "{output}");
+    assert!(output.contains("matches!(raw, 1 | 0)"), "{output}");
 }
 
 #[test]
@@ -131,13 +145,13 @@ fn removes_imported_compatibility_aliases() {
     .unwrap();
     fs::write(
         project.path().join("src/lib.rs"),
-        "pub mod mode; pub mod worker;\n",
+        "pub mod mode; pub mod worker; mod unrelated { const MODE_FAST: i32 = 99; }\n",
     )
     .unwrap();
     fs::write(project.path().join("src/mode.rs"), ENUM).unwrap();
     fs::write(
         project.path().join("src/worker.rs"),
-        "use crate::mode::{MODE_FAST, MODE_SLOW};\npub fn raw(fast: bool) -> i32 { if fast { MODE_FAST } else { MODE_SLOW } }\n",
+        "use crate::mode::{MODE_FAST, MODE_SLOW};\npub fn raw(fast: bool) -> i32 { if fast { MODE_FAST } else { MODE_SLOW } }\npub fn known(raw: i32) -> bool { matches!(raw, MODE_FAST | MODE_SLOW) }\npub fn qualified() -> i32 { crate::mode::MODE_FAST }\n",
     )
     .unwrap();
     let output = Command::cargo_bin("rust-refactor")
@@ -171,6 +185,11 @@ fn removes_imported_compatibility_aliases() {
     assert!(!worker.contains("MODE_FAST"), "{worker}");
     assert!(!worker.contains("MODE_SLOW"), "{worker}");
     assert!(worker.contains("use crate::mode::Mode;"), "{worker}");
+    assert!(
+        worker.contains("crate::mode::Mode::Fast.to_raw()"),
+        "{worker}"
+    );
+    assert!(worker.contains("matches!(raw, 1 | 0)"), "{worker}");
     assert!(
         worker.contains("crate::mode::Mode::Fast.to_raw()"),
         "{worker}"

@@ -23,10 +23,42 @@ pub enum Command {
     EnumHoist(EnumHoistCommand),
     EnumHoistStats(EnumHoistStatsCommand),
     Inline(InlineCommand),
+    OutParamStats(OutParamStatsCommand),
     ToOop(ToOopCommand),
     ToOopStats(ToOopStatsCommand),
     RemoveFunction(RemoveFunctionCommand),
+    ReturnStats(ReturnStatsCommand),
     SimplifyWrapper(SimplifyWrapperCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct OutParamStatsCommand {
+    /// Cargo manifest path for the workspace.
+    #[arg(long)]
+    pub manifest_path: Option<Utf8PathBuf>,
+    /// Output format for the output-parameter inventory.
+    #[arg(long, value_enum, default_value_t = ReturnStatsFormat::Text)]
+    pub format: ReturnStatsFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ReturnStatsCommand {
+    /// Cargo manifest path for the workspace.
+    #[arg(long)]
+    pub manifest_path: Option<Utf8PathBuf>,
+    /// Only emit functions for which an Option or Result rewrite is suggested.
+    #[arg(long)]
+    pub candidates_only: bool,
+    /// Output format for the return-value inventory.
+    #[arg(long, value_enum, default_value_t = ReturnStatsFormat::Text)]
+    pub format: ReturnStatsFormat,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ReturnStatsFormat {
+    Text,
+    Json,
+    Csv,
 }
 
 #[derive(Debug, Args)]

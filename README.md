@@ -6,10 +6,10 @@ The benefit of using this tool over "raw" LLM is that
 * Synchronized edits will be made across files, informed by static analysis - More precise and avoids LLMs not wanting to make "breaking edits"
 * Less token usage because the tool is tailored for the purpose
 
-The CLI has ten subcommands: `constants-to-enum`, `constants-to-enum-csv`,
+The CLI has twelve subcommands: `constants-to-enum`, `constants-to-enum-csv`,
 `constants-to-enum-stats`, `enum-hoist`, `enum-hoist-stats`, `inline`, `to-oop`,
-`to-oop-stats`, `remove-function`, and `simplify-wrapper`. Run
-`rust-refactor <command> --help` for all options.
+`to-oop-stats`, `out-param-stats`, `remove-function`, `return-stats`, and
+`simplify-wrapper`. Run `rust-refactor <command> --help` for all options.
 
 
 ## Command: Inline annotated functions
@@ -137,6 +137,68 @@ does not generate forwarding wrappers.
 
 A large translation case is documented in
 [the imod case study](docs/IMOD_CASE_STUDY.md).
+
+## Find C-style return conventions
+
+`return-stats` scans function bodies without loading rust-analyzer. It reports
+explicit `return` expressions and final expressions, including the individual
+outcomes of `if`, `else if`, and `match`. A negative integer return suggests a
+`Result` rewrite. A null pointer return, including `null`, `null_mut`, and a
+zero-to-pointer cast, suggests an `Option` rewrite. Simple integer constants
+are resolved when their value is unambiguous in the file or workspace. An
+obvious `cmp` or `compare` function returning exactly `-1`, `0`, and `1` is
+marked `ordered_comparison` rather than proposed as a `Result` conversion.
+
+Use CSV as the review table for another LLM:
+
+```sh
+./target/debug/rust-refactor return-stats \
+  --manifest-path /path/to/Cargo.toml --format csv > returns.csv
+./target/debug/rust-refactor return-stats \
+  --manifest-path /path/to/Cargo.toml --format csv --candidates-only
+```
+
+Each row identifies the function and source location, function kind,
+visibility, declared return type, suggested Rust return family, confidence,
+and reason. It lists known values, resolved negative sentinels, null forms,
+unknown expressions, the number of return sites, and `LINE:COLUMN:VALUE`
+evidence. The complete table includes functions without a suggestion so an
+LLM can audit missed conventions; `--candidates-only` keeps only proposed
+`Result` and `Option` rewrites. JSON contains the same fields and aggregate
+counts. This command only discovers candidates and does not edit source.
+
+The analysis deliberately leaves arbitrary calls and calculations in the
+`unknown_return_values` column. It does not infer values through control flow
+or resolve ambiguous constants. Those rows remain useful evidence without
+turning an uncertain expression into an automatic recommendation.
+
+## Find write-only mutable output parameters
+
+`out-param-stats` finds functions with one or more `&mut T` parameters that
+are only used as pure assignment destinations. Definite writes include
+`*output = value`, `output.field = value`, and tuple assignments containing
+those forms. A parameter must have at least one write. Indexed destinations
+such as `output[index] = value` are excluded because they usually fill reusable
+caller-owned storage rather than return one value.
+
+```sh
+./target/debug/rust-refactor out-param-stats \
+  --manifest-path /path/to/Cargo.toml --format csv > output-parameters.csv
+```
+
+The CSV has one row per function and includes its file and source location,
+kind, visibility, output parameter names and types, write counts, and source
+evidence. Writes are classified as `direct` or `field`. Field writes include a
+review note that the parameter may intentionally preserve allocation or
+existing state and may be worth keeping. JSON contains the same data as
+structured parameter lists. Text is a compact terminal table.
+
+The scanner is conservative. It omits a parameter if it is read, used in a
+compound assignment, passed to another function, mentioned in a macro,
+reassigned as a reference binding, shadowed, or used in a form whose effect is
+uncertain. A write-only result is therefore suitable for LLM review as a
+candidate for conversion into a returned value. This command does not edit
+source.
 
 ## Command: Introduce an enum for integer constants
 
