@@ -74,6 +74,12 @@ pub struct EnumHoistCommand {
     /// Seed a function return at its function name as FILE:LINE:COLUMN.
     #[arg(long = "return", value_name = "FILE:LINE:COLUMN")]
     pub returns: Vec<String>,
+    /// Replace compatibility constants with Enum::Variant.to_raw() and remove their declarations.
+    #[arg(long)]
+    pub remove_aliases: bool,
+    /// Also remove aliases for FILE=ENUM. Repeat to batch cleanup in one workspace load.
+    #[arg(long = "remove-aliases-from", value_name = "FILE=ENUM")]
+    pub remove_aliases_from: Vec<String>,
     /// Validate and print the complete plan without changing files.
     #[arg(long, conflicts_with = "write")]
     pub dry_run: bool,

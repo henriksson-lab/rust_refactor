@@ -75,6 +75,160 @@ fn run_write(project: &TempDir, seed_kind: &str, needle: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn run_alias_cleanup(project: &TempDir) -> Value {
+    let output = Command::cargo_bin("rust-refactor")
+        .unwrap()
+        .args([
+            "enum-hoist",
+            "--enum-file",
+            "src/lib.rs",
+            "--enum-name",
+            "Mode",
+            "--remove-aliases",
+            "--write",
+            "--format",
+            "json",
+            "--manifest-path",
+        ])
+        .arg(project.path().join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn removes_compatibility_aliases_and_inlines_remaining_raw_uses() {
+    let project = project(
+        r#"
+pub fn raw_mode(fast: bool) -> i32 {
+    if fast { MODE_FAST } else { MODE_SLOW }
+}
+"#,
+    );
+    let result = run_alias_cleanup(&project);
+    assert_eq!(result["status"], "applied");
+    assert_eq!(result["target"]["aliases_removed"], 2);
+    let output = fs::read_to_string(project.path().join("src/lib.rs")).unwrap();
+    assert!(!output.contains("pub const MODE_"), "{output}");
+    assert!(output.contains("Mode::Fast.to_raw()"), "{output}");
+    assert!(output.contains("Mode::Slow.to_raw()"), "{output}");
+}
+
+#[test]
+fn removes_imported_compatibility_aliases() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname='enum-alias-imports'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/lib.rs"),
+        "pub mod mode; pub mod worker;\n",
+    )
+    .unwrap();
+    fs::write(project.path().join("src/mode.rs"), ENUM).unwrap();
+    fs::write(
+        project.path().join("src/worker.rs"),
+        "use crate::mode::{MODE_FAST, MODE_SLOW};\npub fn raw(fast: bool) -> i32 { if fast { MODE_FAST } else { MODE_SLOW } }\n",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("rust-refactor")
+        .unwrap()
+        .args([
+            "enum-hoist",
+            "--enum-file",
+            "src/mode.rs",
+            "--enum-name",
+            "Mode",
+            "--enum-path",
+            "crate::mode::Mode",
+            "--remove-aliases",
+            "--write",
+            "--format",
+            "json",
+            "--manifest-path",
+        ])
+        .arg(project.path().join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = fs::read_to_string(project.path().join("src/mode.rs")).unwrap();
+    let worker = fs::read_to_string(project.path().join("src/worker.rs")).unwrap();
+    assert!(!mode.contains("pub const MODE_"), "{mode}");
+    assert!(!worker.contains("MODE_FAST"), "{worker}");
+    assert!(!worker.contains("MODE_SLOW"), "{worker}");
+    assert!(worker.contains("use crate::mode::Mode;"), "{worker}");
+    assert!(
+        worker.contains("crate::mode::Mode::Fast.to_raw()"),
+        "{worker}"
+    );
+}
+
+#[test]
+fn removes_aliases_for_multiple_enums_in_one_run() {
+    let project = project(
+        r#"
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Axis { X = 0, Y = 1 }
+impl Axis {
+    pub const fn from_raw(value: i32) -> Option<Self> {
+        match value { 0 => Some(Self::X), 1 => Some(Self::Y), _ => None }
+    }
+    pub const fn to_raw(self) -> i32 { self as i32 }
+}
+pub const AXIS_X: i32 = Axis::X.to_raw();
+pub const AXIS_Y: i32 = Axis::Y.to_raw();
+pub fn values() -> (i32, i32) { (MODE_FAST, AXIS_Y) }
+"#,
+    );
+    let output = Command::cargo_bin("rust-refactor")
+        .unwrap()
+        .args([
+            "enum-hoist",
+            "--enum-file",
+            "src/lib.rs",
+            "--enum-name",
+            "Mode",
+            "--remove-aliases",
+            "--remove-aliases-from",
+            "src/lib.rs=Axis",
+            "--write",
+            "--format",
+            "json",
+            "--manifest-path",
+        ])
+        .arg(project.path().join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["target"]["aliases_removed"], 4);
+    let output = fs::read_to_string(project.path().join("src/lib.rs")).unwrap();
+    assert!(!output.contains("pub const MODE_"), "{output}");
+    assert!(!output.contains("pub const AXIS_"), "{output}");
+    assert!(output.contains("Mode::Fast.to_raw()"), "{output}");
+    assert!(output.contains("Axis::Y.to_raw()"), "{output}");
+}
+
 #[test]
 fn hoists_a_closed_parameter_chain_to_the_variant_source() {
     let project = project(
@@ -98,6 +252,32 @@ pub fn root() -> bool { relay(MODE_FAST) }
     assert!(output.contains("fn relay(mode: Mode)"), "{output}");
     assert!(output.contains("relay(Mode::Fast)"), "{output}");
     assert!(!output.contains("Mode::from_raw(mode)"), "{output}");
+}
+
+#[test]
+fn rewrites_nested_comparisons_in_an_option_match_and_macro_callers() {
+    let project = project(
+        r#"
+pub fn classify(mode: i32) -> bool {
+    match Mode::from_raw(mode) {
+        Some(Mode::Slow) | Some(Mode::Fast) => mode == MODE_FAST,
+        _ => false,
+    }
+}
+pub fn root() -> bool {
+    assert!(classify(MODE_FAST));
+    true
+}
+"#,
+    );
+    let result = run_write(&project, "--parameter", "mode: i32");
+    assert_eq!(result["status"], "applied");
+    let output = fs::read_to_string(project.path().join("src/lib.rs")).unwrap();
+    assert!(output.contains("fn classify(mode: Mode)"), "{output}");
+    assert!(output.contains("match mode"), "{output}");
+    assert!(output.contains("Mode::Slow | Mode::Fast"), "{output}");
+    assert!(output.contains("mode == Mode::Fast"), "{output}");
+    assert!(output.contains("assert!(classify(Mode::Fast))"), "{output}");
 }
 
 #[test]
@@ -561,4 +741,71 @@ pub fn root() -> bool { left(MODE_FAST, 2) }
     assert!(output.contains("fn left(mode: Mode"), "{output}");
     assert!(output.contains("fn right(mode: Mode"), "{output}");
     assert!(output.contains("left(Mode::Fast, 2)"), "{output}");
+}
+
+#[test]
+fn propagates_from_constructor_parameters_into_a_stored_field() {
+    let project = project(
+        r#"
+pub struct Window { pub mode: i32 }
+impl Window {
+    pub fn new(mode: i32) -> Self { Self { mode } }
+    pub fn explicit(mode: i32) -> Self { Self { mode: mode } }
+    pub fn is_fast(&self) -> bool {
+        Mode::from_raw(self.mode) == Some(Mode::Fast)
+    }
+}
+pub fn root() -> bool {
+    Window::new(MODE_FAST).is_fast() && Window::explicit(MODE_SLOW).is_fast()
+}
+"#,
+    );
+    let result = run_write(
+        &project,
+        "--parameter",
+        "mode: i32) -> Self { Self { mode }",
+    );
+    assert_eq!(result["status"], "applied");
+    assert_eq!(
+        result["target"]["typed_places"].as_array().unwrap().len(),
+        3
+    );
+    let output = fs::read_to_string(project.path().join("src/lib.rs")).unwrap();
+    assert!(output.contains("pub mode: Mode"), "{output}");
+    assert!(output.contains("fn new(mode: Mode)"), "{output}");
+    assert!(output.contains("fn explicit(mode: Mode)"), "{output}");
+    assert!(output.contains("Window::new(Mode::Fast)"), "{output}");
+    assert!(output.contains("Window::explicit(Mode::Slow)"), "{output}");
+    assert!(!output.contains("Mode::from_raw(self.mode)"), "{output}");
+}
+
+#[test]
+fn propagates_through_a_shorthand_struct_initializer_alone() {
+    let project = project(
+        r#"
+pub struct Window { pub mode: i32 }
+impl Window {
+    pub fn new(mode: i32) -> Self { Self { mode } }
+    pub fn is_fast(&self) -> bool {
+        Mode::from_raw(self.mode) == Some(Mode::Fast)
+    }
+}
+pub fn root() -> bool { Window::new(MODE_FAST).is_fast() }
+"#,
+    );
+    let result = run_write(
+        &project,
+        "--parameter",
+        "mode: i32) -> Self { Self { mode }",
+    );
+    assert_eq!(result["status"], "applied");
+    assert_eq!(
+        result["target"]["typed_places"].as_array().unwrap().len(),
+        2
+    );
+    let output = fs::read_to_string(project.path().join("src/lib.rs")).unwrap();
+    assert!(output.contains("pub mode: Mode"), "{output}");
+    assert!(output.contains("fn new(mode: Mode)"), "{output}");
+    assert!(output.contains("Window::new(Mode::Fast)"), "{output}");
+    assert!(!output.contains("Mode::from_raw(self.mode)"), "{output}");
 }

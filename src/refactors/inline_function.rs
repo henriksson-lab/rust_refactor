@@ -510,6 +510,7 @@ mod tests {
             callee_range: range(20, 26),
             callee: "helper".to_owned(),
             args: vec!["a + b".to_owned(), "c".to_owned()],
+            arg_ranges: Vec::new(),
             identifiers_in_file: BTreeSet::new(),
         };
 
@@ -532,6 +533,7 @@ mod tests {
             callee_range: range(20, 26),
             callee: "square".to_owned(),
             args: vec!["next()".to_owned()],
+            arg_ranges: Vec::new(),
             identifiers_in_file: BTreeSet::new(),
         };
 

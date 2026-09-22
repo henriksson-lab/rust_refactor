@@ -8,12 +8,13 @@ use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use ra_ap_syntax::{
     ast::{self, AstNode, BinaryOp, CmpOp, HasArgList, HasAttrs, HasName},
-    Edition, SourceFile,
+    Edition, SourceFile, SyntaxKind,
 };
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    time::Instant,
 };
 use text_size::{TextRange, TextSize};
 
@@ -23,7 +24,7 @@ use crate::{
     cli::{EnumHoistCommand, EnumHoistStatsCommand, OutputFormat},
     edits::{apply_edits_to_string, apply_plan, RefactorPlan, TextEdit},
     project::Project,
-    semantic::{SemanticDefinition, SemanticProject},
+    semantic::{SemanticDefinition, SemanticProject, SemanticReference},
     verify,
 };
 
@@ -93,6 +94,12 @@ struct Place {
     kind: PlaceKind,
 }
 
+#[derive(Default)]
+struct ReferenceIndex {
+    by_name: BTreeMap<String, Vec<SemanticReference>>,
+    functions_by_name: BTreeMap<String, Vec<SemanticDefinition>>,
+}
+
 #[derive(Clone, Copy)]
 enum SeedKind {
     Parameter,
@@ -108,6 +115,8 @@ struct EnumInfo {
     raw_type: String,
     variants: BTreeMap<SemanticDefinitionKey, String>,
     aliases: BTreeMap<SemanticDefinitionKey, String>,
+    variant_names: BTreeMap<String, String>,
+    alias_names: BTreeMap<String, String>,
     values: BTreeMap<i128, String>,
     from_raw: Option<SemanticDefinitionKey>,
     to_raw: Option<SemanticDefinitionKey>,
@@ -177,6 +186,36 @@ impl PlanBuilder {
                 Some(range),
             );
         }
+        if let Some(containing_key) = self
+            .edits
+            .iter()
+            .find(|(_, edit)| {
+                &edit.file == file && !edit.range.is_empty() && edit.range.contains_range(range)
+            })
+            .map(|(key, _)| key.clone())
+        {
+            let source = fs::read_to_string(file)?;
+            let original = text_at(&source, range);
+            let containing = self.edits.get_mut(&containing_key).unwrap();
+            let occurrences = containing
+                .replacement
+                .match_indices(original)
+                .map(|(start, _)| start)
+                .collect::<Vec<_>>();
+            if occurrences.len() != 1 {
+                return refuse(
+                    "CONFLICTING_EDITS",
+                    "an inner value rewrite could not be uniquely composed into its containing rewrite",
+                    Some(file.clone()),
+                    Some(range),
+                );
+            }
+            let start = occurrences[0];
+            containing
+                .replacement
+                .replace_range(start..start + original.len(), &replacement);
+            return Ok(());
+        }
         let contained = self
             .edits
             .iter()
@@ -204,7 +243,10 @@ impl PlanBuilder {
             }
         }
         for existing in self.edits.values().filter(|edit| &edit.file == file) {
-            if existing.range.intersect(range).is_some()
+            if existing
+                .range
+                .intersect(range)
+                .is_some_and(|intersection| !intersection.is_empty())
                 && !existing.range.is_empty()
                 && !range.is_empty()
             {
@@ -270,6 +312,11 @@ pub fn run_stats(command: EnumHoistStatsCommand) -> Result<()> {
     )
     .map_err(flow_error)?;
     let places = collect_places(&files, &info.raw_type);
+    let reference_index = collect_reference_index(&files);
+    let file_map = files
+        .iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
     let mut candidates: BTreeMap<String, (String, String, Utf8PathBuf, TextRange, usize)> =
         BTreeMap::new();
     for file in &files {
@@ -288,11 +335,14 @@ pub fn run_stats(command: EnumHoistStatsCommand) -> Result<()> {
             else {
                 continue;
             };
+            let callee_text = callee.syntax().text().to_string();
+            let syntactic_enum_call = callee_text.ends_with(&format!("{}::from_raw", info.name));
             if name.text() != "from_raw"
-                || !definition_matches(
-                    semantic.definition_at(&file.path, name.syntax().text_range())?,
-                    info.from_raw.as_ref(),
-                )
+                || (!syntactic_enum_call
+                    && !definition_matches(
+                        semantic.definition_at(&file.path, name.syntax().text_range())?,
+                        info.from_raw.as_ref(),
+                    ))
             {
                 continue;
             }
@@ -314,11 +364,18 @@ pub fn run_stats(command: EnumHoistStatsCommand) -> Result<()> {
         }
     }
     let mut values = candidates
-        .into_values()
-        .map(|(kind, subject, file, range, conversions)| {
+        .into_iter()
+        .map(|(id, (kind, subject, file, range, conversions))| {
             let parsed = files.iter().find(|parsed| parsed.path == file).unwrap();
             let (line, column) = line_column(&parsed.source, range.start().into());
-            let references = semantic.references_to(&file, range).unwrap_or_default();
+            let references = place_references(
+                &places[&id],
+                &places,
+                &file_map,
+                &reference_index,
+                &semantic,
+            )
+            .unwrap_or_default();
             json!({
                 "kind":kind,
                 "subject":subject,
@@ -443,14 +500,15 @@ fn run_inner(
             None,
         );
     }
-    if command.parameters.is_empty()
+    let has_seeds = !(command.parameters.is_empty()
         && command.fields.is_empty()
         && command.locals.is_empty()
-        && command.returns.is_empty()
-    {
+        && command.returns.is_empty());
+    let has_alias_cleanup = command.remove_aliases || !command.remove_aliases_from.is_empty();
+    if !has_seeds && !has_alias_cleanup {
         return refuse(
             "NO_SEEDS",
-            "select at least one --parameter, --field, --local, or --return",
+            "select at least one typed value-flow seed or --remove-aliases",
             None,
             None,
         );
@@ -464,6 +522,7 @@ fn run_inner(
     let semantic =
         SemanticProject::load_with(&project, command.all_features, command.target.as_deref())?;
     let enum_file = resolve_file(&project, &command.enum_file)?;
+    let started = Instant::now();
     let enum_info = collect_enum_info(
         &enum_file,
         &command.enum_name,
@@ -471,7 +530,41 @@ fn run_inner(
         &files,
         &semantic,
     )?;
-    let places = collect_places(&files, &enum_info.raw_type);
+    let mut cleanup_enum_infos = Vec::new();
+    if command.remove_aliases {
+        cleanup_enum_infos.push(enum_info.clone());
+    }
+    for specification in &command.remove_aliases_from {
+        let Some((file, name)) = specification.rsplit_once('=') else {
+            return refuse(
+                "INVALID_ENUM_SPECIFICATION",
+                format!("`{specification}` must use FILE=ENUM"),
+                None,
+                None,
+            );
+        };
+        if file.is_empty() || name.is_empty() {
+            return refuse(
+                "INVALID_ENUM_SPECIFICATION",
+                format!("`{specification}` must use nonempty FILE=ENUM"),
+                None,
+                None,
+            );
+        }
+        let file = resolve_file(&project, &Utf8PathBuf::from(file))?;
+        cleanup_enum_infos.push(collect_enum_info(&file, name, name, &files, &semantic)?);
+    }
+    report_timing("collect enum information", started);
+    let started = Instant::now();
+    let places = if has_seeds {
+        collect_places(&files, &enum_info.raw_type)
+    } else {
+        BTreeMap::new()
+    };
+    report_timing("collect typed places", started);
+    let started = Instant::now();
+    let reference_index = collect_reference_index(&files);
+    report_timing("collect reference index", started);
     let mut selected = BTreeSet::new();
     for position in &command.parameters {
         selected.insert(select_place(
@@ -516,7 +609,16 @@ fn run_inner(
         let place = places
             .get(&id)
             .ok_or_else(|| anyhow!("missing place {id}"))?;
-        let producers = incoming_producers(place, &places, &file_map, &semantic, &enum_info)?;
+        let started = Instant::now();
+        let producers = incoming_producers(
+            place,
+            &places,
+            &file_map,
+            &reference_index,
+            &semantic,
+            &enum_info,
+        )?;
+        report_timing(&format!("incoming producers for {}", place.name), started);
         for producer in producers {
             if let Some(source) = producer.place {
                 if selected.insert(source.clone()) {
@@ -527,7 +629,17 @@ fn run_inner(
                 producer_edits.push((producer.file, producer.range, replacement));
             }
         }
-        for target in connected_consumers(place, &places, &file_map, &semantic, &enum_info)? {
+        let started = Instant::now();
+        let consumers = connected_consumers(
+            place,
+            &places,
+            &file_map,
+            &reference_index,
+            &semantic,
+            &enum_info,
+        )?;
+        report_timing(&format!("connected consumers for {}", place.name), started);
+        for target in consumers {
             if selected.insert(target.clone()) {
                 queue.push_back(target);
             }
@@ -550,12 +662,25 @@ fn run_inner(
             &selected,
             &places,
             &file_map,
+            &reference_index,
             &semantic,
             &enum_info,
             &mut builder,
         )?;
     }
-    if builder.removed_conversions <= builder.inserted_conversions {
+    let aliases_removed = if cleanup_enum_infos.is_empty() {
+        0
+    } else {
+        remove_compatibility_aliases(
+            &files,
+            &file_map,
+            &reference_index,
+            &semantic,
+            &cleanup_enum_infos,
+            &mut builder,
+        )?
+    };
+    if has_seeds && builder.removed_conversions <= builder.inserted_conversions {
         return refuse(
             "NO_CONVERSION_REDUCTION",
             format!(
@@ -586,7 +711,8 @@ fn run_inner(
             "before": builder.removed_conversions,
             "after": builder.inserted_conversions,
             "removed": builder.removed_conversions.saturating_sub(builder.inserted_conversions)
-        }
+        },
+        "aliases_removed": aliases_removed
     });
     if command.dry_run {
         return Ok(("planned", plan, target));
@@ -608,6 +734,384 @@ fn run_inner(
         ));
     }
     Ok(("applied", plan, target))
+}
+
+fn report_timing(label: &str, started: Instant) {
+    if std::env::var_os("RUST_REFACTOR_TIMING").is_some() {
+        eprintln!(
+            "rust-refactor timing: {label}: {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn collect_reference_index(files: &[ParsedFile]) -> ReferenceIndex {
+    let mut index = ReferenceIndex::default();
+    for file in files {
+        for function in file.tree.syntax().descendants().filter_map(ast::Fn::cast) {
+            if let Some(name) = function.name() {
+                index
+                    .functions_by_name
+                    .entry(name.text().to_string())
+                    .or_default()
+                    .push(SemanticDefinition {
+                        file: file.path.clone(),
+                        name_range: name.syntax().text_range(),
+                    });
+            }
+        }
+        for name in file
+            .tree
+            .syntax()
+            .descendants()
+            .filter_map(ast::NameRef::cast)
+        {
+            index
+                .by_name
+                .entry(name.text().to_string())
+                .or_default()
+                .push(SemanticReference {
+                    file: file.path.clone(),
+                    range: name.syntax().text_range(),
+                });
+        }
+        for call in file
+            .tree
+            .syntax()
+            .descendants()
+            .filter_map(ast::MacroCall::cast)
+        {
+            for token in call
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+            {
+                if token.kind() == SyntaxKind::IDENT {
+                    index
+                        .by_name
+                        .entry(token.text().to_owned())
+                        .or_default()
+                        .push(SemanticReference {
+                            file: file.path.clone(),
+                            range: token.text_range(),
+                        });
+                }
+            }
+        }
+    }
+    for references in index.by_name.values_mut() {
+        references.sort_by(|left, right| {
+            (&left.file, left.range.start(), left.range.end()).cmp(&(
+                &right.file,
+                right.range.start(),
+                right.range.end(),
+            ))
+        });
+        references.dedup();
+    }
+    index
+}
+
+fn remove_compatibility_aliases(
+    files: &[ParsedFile],
+    file_map: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
+    semantic: &SemanticProject,
+    infos: &[EnumInfo],
+    builder: &mut PlanBuilder,
+) -> std::result::Result<usize, FlowError> {
+    let imports = analysis::collect_import_sites(files);
+    let mut definition_counts = BTreeMap::<String, usize>::new();
+    for file in files {
+        for name in file.tree.syntax().descendants().filter_map(ast::Name::cast) {
+            *definition_counts
+                .entry(name.text().to_string())
+                .or_default() += 1;
+        }
+    }
+    let mut removed_items = BTreeSet::new();
+    let mut import_deletions = Vec::new();
+    let mut added_enum_imports = BTreeSet::new();
+    for info in infos {
+        for (definition, variant) in &info.aliases {
+            let parsed = file_map
+                .get(&definition.file)
+                .ok_or_else(|| anyhow!("alias definition file was not parsed"))?;
+            let name_range = TextRange::new(
+                TextSize::from(definition.start),
+                TextSize::from(definition.end),
+            );
+            let name = text_at(&parsed.source, name_range).to_owned();
+            let item = ancestor_at::<ast::Const>(parsed, name_range)
+                .ok_or_else(|| anyhow!("enum compatibility alias is not a const item"))?;
+            let item_range = item.syntax().text_range();
+            let alias_references = if definition_counts.get(&name) == Some(&1) {
+                references.by_name.get(&name).cloned().unwrap_or_default()
+            } else {
+                indexed_references(references, semantic, &definition.file, name_range, &name)?
+            };
+            for reference in alias_references {
+                if reference.file == definition.file && item_range.contains_range(reference.range) {
+                    continue;
+                }
+                if builder.covers(&reference.file, reference.range) {
+                    continue;
+                }
+                if let Some(import) = imports.iter().find(|import| {
+                    import.file == reference.file
+                        && import.function_name == name
+                        && import.name_range == reference.range
+                }) {
+                    let import_key = (reference.file.clone(), info.name.clone());
+                    let enum_already_imported = imports.iter().any(|candidate| {
+                        candidate.file == reference.file && candidate.function_name == info.name
+                    });
+                    if !enum_already_imported && added_enum_imports.insert(import_key) {
+                        builder.add(&reference.file, import.name_range, info.name.clone())?;
+                    } else {
+                        import_deletions.push((reference.file.clone(), import.use_range));
+                    }
+                    continue;
+                }
+                builder.add(
+                    &reference.file,
+                    reference.range,
+                    format!("{}::{variant}.to_raw()", info.path),
+                )?;
+            }
+            if removed_items.insert((
+                definition.file.clone(),
+                u32::from(item_range.start()),
+                u32::from(item_range.end()),
+            )) {
+                builder.add(&definition.file, item_range, "")?;
+            }
+        }
+    }
+    import_deletions.sort_by_key(|(file, range)| (file.clone(), range.start(), range.end()));
+    let mut merged_import_deletions: Vec<(Utf8PathBuf, TextRange)> = Vec::new();
+    for (file, range) in import_deletions {
+        if let Some((previous_file, previous_range)) = merged_import_deletions.last_mut() {
+            if previous_file == &file && range.start() <= previous_range.end() {
+                *previous_range = TextRange::new(
+                    previous_range.start().min(range.start()),
+                    previous_range.end().max(range.end()),
+                );
+                continue;
+            }
+        }
+        merged_import_deletions.push((file, range));
+    }
+    for (file, range) in merged_import_deletions {
+        builder.add(&file, range, "")?;
+    }
+    if removed_items.is_empty() {
+        return refuse(
+            "NO_COMPATIBILITY_ALIASES",
+            "the selected enum has no generated integer compatibility constants",
+            None,
+            None,
+        );
+    }
+    Ok(removed_items.len())
+}
+
+fn indexed_references(
+    index: &ReferenceIndex,
+    semantic: &SemanticProject,
+    file: &Utf8PathBuf,
+    range: TextRange,
+    name: &str,
+) -> Result<Vec<SemanticReference>> {
+    let expected = SemanticDefinition {
+        file: file.clone(),
+        name_range: range,
+    };
+    let mut references = Vec::new();
+    for candidate in index.by_name.get(name).into_iter().flatten() {
+        if candidate.file == *file && candidate.range == range {
+            continue;
+        }
+        if semantic
+            .definitions_at(&candidate.file, candidate.range)?
+            .iter()
+            .any(|definition| definition == &expected)
+        {
+            references.push(candidate.clone());
+        }
+    }
+    Ok(references)
+}
+
+fn place_references(
+    place: &Place,
+    places: &BTreeMap<String, Place>,
+    files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    index: &ReferenceIndex,
+    semantic: &SemanticProject,
+) -> Result<Vec<SemanticReference>> {
+    if let Some(references) = syntactic_place_references(place, places, files, index) {
+        return Ok(references);
+    }
+    indexed_references(
+        index,
+        semantic,
+        &place.file,
+        place.name_range,
+        place_reference_name(place),
+    )
+}
+
+fn syntactic_place_references(
+    place: &Place,
+    places: &BTreeMap<String, Place>,
+    files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    index: &ReferenceIndex,
+) -> Option<Vec<SemanticReference>> {
+    let candidates = index.by_name.get(place_reference_name(place))?;
+    match place.kind {
+        PlaceKind::Field { .. } => {
+            if places
+                .values()
+                .filter(|candidate| {
+                    candidate.name == place.name
+                        && matches!(candidate.kind, PlaceKind::Field { .. })
+                })
+                .count()
+                != 1
+            {
+                return None;
+            }
+            Some(
+                candidates
+                    .iter()
+                    .filter(|reference| {
+                        files.get(&reference.file).is_some_and(|parsed| {
+                            ancestor_at::<ast::FieldExpr>(parsed, reference.range).is_some()
+                                || ancestor_at::<ast::RecordExprField>(parsed, reference.range)
+                                    .is_some()
+                        })
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        }
+        PlaceKind::Parameter { .. } | PlaceKind::Local => {
+            let parsed = files.get(&place.file)?;
+            let owner = parsed
+                .tree
+                .syntax()
+                .descendants()
+                .filter_map(ast::Fn::cast)
+                .find(|function| {
+                    function
+                        .syntax()
+                        .text_range()
+                        .contains_range(place.name_range)
+                })?;
+            let owner_range = owner.syntax().text_range();
+            if places
+                .values()
+                .filter(|candidate| {
+                    candidate.file == place.file
+                        && candidate.name == place.name
+                        && owner_range.contains_range(candidate.name_range)
+                        && matches!(
+                            candidate.kind,
+                            PlaceKind::Parameter { .. } | PlaceKind::Local
+                        )
+                })
+                .count()
+                != 1
+            {
+                return None;
+            }
+            Some(
+                candidates
+                    .iter()
+                    .filter(|reference| {
+                        reference.file == place.file
+                            && owner_range.contains_range(reference.range)
+                            && files.get(&reference.file).is_some_and(|parsed| {
+                                ancestor_at::<ast::PathExpr>(parsed, reference.range).is_some()
+                                    || ancestor_at::<ast::RecordExprField>(parsed, reference.range)
+                                        .is_some_and(|field| field.colon_token().is_none())
+                            })
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        }
+        PlaceKind::Return { .. } => None,
+    }
+}
+
+fn function_references(
+    file: &Utf8PathBuf,
+    range: TextRange,
+    name: &str,
+    files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    index: &ReferenceIndex,
+    semantic: &SemanticProject,
+) -> Result<Vec<SemanticReference>> {
+    let unique = index
+        .functions_by_name
+        .get(name)
+        .is_some_and(|definitions| {
+            definitions.len() == 1
+                && definitions[0].file == *file
+                && definitions[0].name_range == range
+        });
+    let owner = files.get(file).and_then(|parsed| {
+        parsed
+            .tree
+            .syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .find(|function| {
+                function
+                    .name()
+                    .is_some_and(|function_name| function_name.syntax().text_range() == range)
+            })
+            .and_then(|function| {
+                function
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .find_map(ast::Impl::cast)
+                    .and_then(|implementation| implementation.self_ty())
+                    .map(|ty| ty.syntax().text().to_string())
+            })
+    });
+    if unique || owner.is_some() {
+        return Ok(index
+            .by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|reference| {
+                files.get(&reference.file).is_some_and(|parsed| {
+                    let plausible_owner = owner.as_ref().is_none_or(|owner| {
+                        reference.file == *file || parsed.source.contains(owner)
+                    });
+                    plausible_owner
+                        && (direct_call_at_reference(parsed, reference.range).is_some()
+                            || reference_in_use(parsed, reference.range)
+                            || ancestor_at::<ast::PathExpr>(parsed, reference.range).is_some()
+                            || ancestor_at::<ast::MacroCall>(parsed, reference.range).is_some())
+                })
+            })
+            .cloned()
+            .collect());
+    }
+    indexed_references(index, semantic, file, range, name)
+}
+
+fn place_reference_name(place: &Place) -> &str {
+    match place.kind {
+        PlaceKind::Return { .. } => place.name.strip_suffix(" return").unwrap_or(&place.name),
+        _ => &place.name,
+    }
 }
 
 fn collect_places(files: &[ParsedFile], raw_type: &str) -> BTreeMap<String, Place> {
@@ -797,17 +1301,26 @@ fn incoming_producers(
     place: &Place,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    reference_index: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
 ) -> std::result::Result<Vec<Producer>, FlowError> {
     match &place.kind {
         PlaceKind::Parameter {
+            function_name,
             function_name_range,
             parameter_index,
             method,
             ..
         } => {
-            let references = semantic.references_to(&place.file, *function_name_range)?;
+            let references = function_references(
+                &place.file,
+                *function_name_range,
+                function_name,
+                files,
+                reference_index,
+                semantic,
+            )?;
             let mut producers = Vec::new();
             for reference in references {
                 let parsed = files
@@ -822,12 +1335,33 @@ fn incoming_producers(
                     call_argument(parsed, reference.range, *parameter_index)
                 };
                 let Some(expression) = expression else {
-                    return refuse(
-                        "UNRESOLVED_FUNCTION_REFERENCE",
-                        "a function reference is not a supported direct call",
-                        Some(reference.file),
-                        Some(reference.range),
-                    );
+                    let Some(call) = analysis::macro_call_at(parsed, reference.range) else {
+                        return refuse(
+                            "UNRESOLVED_FUNCTION_REFERENCE",
+                            "a function reference is not a supported direct call",
+                            Some(reference.file),
+                            Some(reference.range),
+                        );
+                    };
+                    let Some((argument, range)) = call
+                        .args
+                        .get(*parameter_index)
+                        .zip(call.arg_ranges.get(*parameter_index))
+                    else {
+                        return refuse(
+                            "UNRESOLVED_FUNCTION_REFERENCE",
+                            "a macro-nested call does not have the selected argument",
+                            Some(reference.file),
+                            Some(reference.range),
+                        );
+                    };
+                    producers.push(classify_text_producer(
+                        argument,
+                        *range,
+                        &reference.file,
+                        enum_info,
+                    )?);
+                    continue;
                 };
                 producers.push(classify_producer(
                     &expression,
@@ -839,8 +1373,12 @@ fn incoming_producers(
             }
             Ok(producers)
         }
-        PlaceKind::Field { .. } => field_producers(place, places, files, semantic, enum_info),
-        PlaceKind::Local => local_producers(place, places, files, semantic, enum_info),
+        PlaceKind::Field { .. } => {
+            field_producers(place, places, files, reference_index, semantic, enum_info)
+        }
+        PlaceKind::Local => {
+            local_producers(place, places, files, reference_index, semantic, enum_info)
+        }
         PlaceKind::Return { .. } => return_producers(place, places, files, semantic, enum_info),
     }
 }
@@ -849,6 +1387,7 @@ fn local_producers(
     place: &Place,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
 ) -> std::result::Result<Vec<Producer>, FlowError> {
@@ -876,7 +1415,7 @@ fn local_producers(
         semantic,
         enum_info,
     )?];
-    for reference in semantic.references_to(&place.file, place.name_range)? {
+    for reference in place_references(place, places, files, references, semantic)? {
         let reference_file = files
             .get(&reference.file)
             .ok_or_else(|| anyhow!("local reference file was not parsed"))?;
@@ -988,6 +1527,7 @@ fn field_producers(
     place: &Place,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
 ) -> std::result::Result<Vec<Producer>, FlowError> {
@@ -1034,28 +1574,35 @@ fn field_producers(
             }
         }
     }
-    let references = semantic.references_to(&place.file, place.name_range)?;
+    let started = Instant::now();
+    let references = place_references(place, places, files, references, semantic)?;
+    report_timing(&format!("resolve {} field references", place.name), started);
     let mut producers = Vec::new();
     for reference in references {
         let parsed = files
             .get(&reference.file)
             .ok_or_else(|| anyhow!("reference file was not parsed"))?;
         if let Some(field) = ancestor_at::<ast::RecordExprField>(parsed, reference.range) {
-            let Some(expression) = field.expr() else {
-                return refuse(
-                    "UNHANDLED_FIELD_WRITE",
-                    "shorthand struct field initialization is not supported yet",
-                    Some(reference.file),
-                    Some(field.syntax().text_range()),
-                );
-            };
-            producers.push(classify_producer(
-                &expression,
-                &reference.file,
-                places,
-                semantic,
-                enum_info,
-            )?);
+            if field.colon_token().is_some() {
+                let expression = field
+                    .expr()
+                    .ok_or_else(|| anyhow!("record field initializer has no expression"))?;
+                producers.push(classify_producer(
+                    &expression,
+                    &reference.file,
+                    places,
+                    semantic,
+                    enum_info,
+                )?);
+            } else {
+                let source = shorthand_record_source(&field, parsed, places, semantic)?;
+                producers.push(Producer {
+                    place: Some(source),
+                    replacement: None,
+                    range: field.syntax().text_range(),
+                    file: reference.file.clone(),
+                });
+            }
             continue;
         }
         if let Some(field_expr) = ancestor_at::<ast::FieldExpr>(parsed, reference.range) {
@@ -1086,6 +1633,71 @@ fn field_producers(
         }
     }
     Ok(producers)
+}
+
+fn shorthand_record_source(
+    field: &ast::RecordExprField,
+    parsed: &ParsedFile,
+    places: &BTreeMap<String, Place>,
+    semantic: &SemanticProject,
+) -> std::result::Result<String, FlowError> {
+    let name_ref =
+        record_field_name_ref(field).ok_or_else(|| anyhow!("shorthand field has no name"))?;
+    let name = name_ref.text().to_string();
+    let field_range = field.syntax().text_range();
+    let containing_function = field
+        .syntax()
+        .ancestors()
+        .find_map(ast::Fn::cast)
+        .map(|function| function.syntax().text_range());
+    let mut candidates = places
+        .values()
+        .filter(|place| {
+            place.file == parsed.path
+                && place.name == name
+                && place.name_range.start() < field_range.start()
+                && matches!(place.kind, PlaceKind::Parameter { .. } | PlaceKind::Local)
+                && containing_function.is_some_and(|range| range.contains_range(place.name_range))
+                && match place.kind {
+                    PlaceKind::Local => parsed
+                        .tree
+                        .syntax()
+                        .descendants()
+                        .filter_map(ast::LetStmt::cast)
+                        .find(|statement| {
+                            statement.pat().is_some_and(|pattern| {
+                                pattern
+                                    .syntax()
+                                    .text_range()
+                                    .contains_range(place.name_range)
+                            })
+                        })
+                        .and_then(|statement| statement.syntax().parent())
+                        .is_some_and(|scope| scope.text_range().contains_range(field_range)),
+                    _ => true,
+                }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|place| place.name_range.start());
+    if let Some(candidate) = candidates.pop() {
+        return Ok(candidate.id.clone());
+    }
+    for definition in semantic.definitions_at(&parsed.path, name_ref.syntax().text_range())? {
+        if let Some(place) = place_for_definition(places, &definition) {
+            if matches!(
+                places[&place].kind,
+                PlaceKind::Parameter { .. } | PlaceKind::Local
+            ) {
+                return Ok(place);
+            }
+        }
+    }
+    refuse(
+        "UNHANDLED_FIELD_WRITE",
+        "a shorthand struct field initializer could not be resolved to one parameter or local",
+        Some(parsed.path.clone()),
+        Some(field.syntax().text_range()),
+    )
 }
 
 fn classify_producer(
@@ -1122,6 +1734,14 @@ fn classify_producer(
             }
         }
     }
+    if let Some(place) = expression_place(&expression, file, places, semantic)? {
+        return Ok(Producer {
+            place: Some(place),
+            replacement: None,
+            range: expression.syntax().text_range(),
+            file: file.clone(),
+        });
+    }
     if let Some(variant) = enum_variant(&expression, file, semantic, enum_info)? {
         let replacement = format!("{}::{variant}", enum_info.path);
         let current = slice_expr(&expression);
@@ -1133,14 +1753,6 @@ fn classify_producer(
         });
     }
     if let Some(place) = call_return_place(&expression, file, places, semantic)? {
-        return Ok(Producer {
-            place: Some(place),
-            replacement: None,
-            range: expression.syntax().text_range(),
-            file: file.clone(),
-        });
-    }
-    if let Some(place) = expression_place(&expression, file, places, semantic)? {
         return Ok(Producer {
             place: Some(place),
             replacement: None,
@@ -1167,19 +1779,59 @@ fn classify_producer(
     )
 }
 
+fn classify_text_producer(
+    expression: &str,
+    range: TextRange,
+    file: &Utf8PathBuf,
+    enum_info: &EnumInfo,
+) -> std::result::Result<Producer, FlowError> {
+    let expression = expression.trim();
+    let final_name = expression.rsplit("::").next().unwrap_or(expression);
+    let variant = enum_info.alias_names.get(final_name).cloned().or_else(|| {
+        (expression.contains(&format!("{}::", enum_info.name))
+            || expression.contains(&format!("{}::", enum_info.path)))
+        .then(|| enum_info.variant_names.get(final_name).cloned())
+        .flatten()
+    });
+    let variant = variant.or_else(|| {
+        parse_integer(expression, &enum_info.raw_type)
+            .and_then(|value| enum_info.values.get(&value).cloned())
+    });
+    if let Some(variant) = variant {
+        return Ok(Producer {
+            place: None,
+            replacement: Some(format!("{}::{variant}", enum_info.path)),
+            range,
+            file: file.clone(),
+        });
+    }
+    refuse(
+        "UNSUPPORTED_ARGUMENT_SOURCE",
+        format!("macro-nested argument `{expression}` is not a known enum value"),
+        Some(file.clone()),
+        Some(range),
+    )
+}
+
 fn connected_consumers(
     place: &Place,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
 ) -> std::result::Result<Vec<String>, FlowError> {
     if matches!(place.kind, PlaceKind::Return { .. }) {
-        return return_consumers(place, places, files, semantic, enum_info);
+        return return_consumers(place, places, files, references, semantic, enum_info);
     }
-    let references = semantic.references_to(&place.file, place.name_range)?;
+    let started = Instant::now();
+    let place_references = place_references(place, places, files, references, semantic)?;
+    report_timing(
+        &format!("resolve {} consumer references", place.name),
+        started,
+    );
     let mut connected = BTreeSet::new();
-    for reference in references {
+    for reference in place_references {
         let parsed = files
             .get(&reference.file)
             .ok_or_else(|| anyhow!("reference file was not parsed"))?;
@@ -1200,6 +1852,10 @@ fn connected_consumers(
             connected.insert(target);
             continue;
         }
+        if let Some(target) = record_field_target(parsed, reference.range, places, semantic)? {
+            connected.insert(target);
+            continue;
+        }
         if let Some(target) = initializer_target(parsed, reference.range, places, semantic)? {
             connected.insert(target);
             continue;
@@ -1215,11 +1871,19 @@ fn return_consumers(
     place: &Place,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
 ) -> std::result::Result<Vec<String>, FlowError> {
     let mut connected = BTreeSet::new();
-    for reference in semantic.references_to(&place.file, place.name_range)? {
+    for reference in function_references(
+        &place.file,
+        place.name_range,
+        place_reference_name(place),
+        files,
+        references,
+        semantic,
+    )? {
         let parsed = files
             .get(&reference.file)
             .ok_or_else(|| anyhow!("return reference file was not parsed"))?;
@@ -1256,19 +1920,29 @@ fn rewrite_place_uses(
     selected: &BTreeSet<String>,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
     builder: &mut PlanBuilder,
 ) -> std::result::Result<(), FlowError> {
     if matches!(place.kind, PlaceKind::Return { .. }) {
-        return rewrite_return_uses(place, selected, places, files, semantic, enum_info, builder);
+        return rewrite_return_uses(
+            place, selected, places, files, references, semantic, enum_info, builder,
+        );
     }
-    let references = semantic.references_to(&place.file, place.name_range)?;
-    for reference in references {
+    let place_references = place_references(place, places, files, references, semantic)?;
+    for reference in place_references {
         let parsed = files
             .get(&reference.file)
             .ok_or_else(|| anyhow!("reference file was not parsed"))?;
         if builder.covers(&reference.file, reference.range) {
+            if let Some(binary) = ancestor_at::<ast::BinExpr>(parsed, reference.range) {
+                if let Some(replacement) =
+                    rewrite_direct_comparison(&binary, &reference.file, semantic, enum_info)?
+                {
+                    builder.add(&reference.file, binary.syntax().text_range(), replacement)?;
+                }
+            }
             continue;
         }
         if ancestor_at::<ast::MacroCall>(parsed, reference.range).is_some() {
@@ -1338,6 +2012,11 @@ fn rewrite_place_uses(
                 continue;
             }
         }
+        if let Some(target) = record_field_target(parsed, reference.range, places, semantic)? {
+            if selected.contains(&target) {
+                continue;
+            }
+        }
         if let Some(target) = initializer_target(parsed, reference.range, places, semantic)? {
             if selected.contains(&target) {
                 continue;
@@ -1375,11 +2054,19 @@ fn rewrite_return_uses(
     selected: &BTreeSet<String>,
     places: &BTreeMap<String, Place>,
     files: &BTreeMap<Utf8PathBuf, &ParsedFile>,
+    references: &ReferenceIndex,
     semantic: &SemanticProject,
     enum_info: &EnumInfo,
     builder: &mut PlanBuilder,
 ) -> std::result::Result<(), FlowError> {
-    for reference in semantic.references_to(&place.file, place.name_range)? {
+    for reference in function_references(
+        &place.file,
+        place.name_range,
+        place_reference_name(place),
+        files,
+        references,
+        semantic,
+    )? {
         let parsed = files
             .get(&reference.file)
             .ok_or_else(|| anyhow!("return reference file was not parsed"))?;
@@ -1480,6 +2167,11 @@ fn argument_target(
             else {
                 return Ok(None);
             };
+            if let Some(place) =
+                parameter_for_unique_function_name(places, &name_ref.text(), index, false)
+            {
+                return Ok(Some(place));
+            }
             let Some(definition) =
                 semantic.definition_at(&file.path, name_ref.syntax().text_range())?
             else {
@@ -1502,6 +2194,11 @@ fn argument_target(
             let Some(name_ref) = call.name_ref() else {
                 return Ok(None);
             };
+            if let Some(place) =
+                parameter_for_unique_function_name(places, &name_ref.text(), index, true)
+            {
+                return Ok(Some(place));
+            }
             let Some(definition) =
                 semantic.definition_at(&file.path, name_ref.syntax().text_range())?
             else {
@@ -1513,6 +2210,25 @@ fn argument_target(
         }
     }
     Ok(None)
+}
+
+fn parameter_for_unique_function_name(
+    places: &BTreeMap<String, Place>,
+    function_name: &str,
+    index: usize,
+    method: bool,
+) -> Option<String> {
+    let mut matches = places.values().filter(|place| match &place.kind {
+        PlaceKind::Parameter {
+            function_name: candidate,
+            parameter_index,
+            method: is_method,
+            ..
+        } => candidate == function_name && *parameter_index == index && *is_method == method,
+        _ => false,
+    });
+    let place = matches.next()?;
+    matches.next().is_none().then(|| place.id.clone())
 }
 
 fn parameter_for_function(
@@ -1553,21 +2269,8 @@ fn assigned_place_target(
         {
             continue;
         }
-        let name_ref = match binary.lhs() {
-            Some(ast::Expr::FieldExpr(field)) => field.name_ref(),
-            Some(ast::Expr::PathExpr(path)) => path
-                .path()
-                .and_then(|path| path.segment())
-                .and_then(|segment| segment.name_ref()),
-            _ => None,
-        };
-        let Some(name_ref) = name_ref else { continue };
-        let Some(definition) =
-            semantic.definition_at(&file.path, name_ref.syntax().text_range())?
-        else {
-            continue;
-        };
-        if let Some(place) = place_for_definition(places, &definition) {
+        let Some(lhs) = binary.lhs() else { continue };
+        if let Some(place) = expression_place(&lhs, &file.path, places, semantic)? {
             return Ok(Some(place));
         }
     }
@@ -1597,6 +2300,43 @@ fn initializer_target(
         };
         if let Some(place) = places.get(&place_id(&file.path, name.syntax().text_range())) {
             return Ok(Some(place.id.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn record_field_target(
+    file: &ParsedFile,
+    range: TextRange,
+    places: &BTreeMap<String, Place>,
+    semantic: &SemanticProject,
+) -> Result<Option<String>> {
+    let Some(field) = ancestor_at::<ast::RecordExprField>(file, range) else {
+        return Ok(None);
+    };
+    if field
+        .expr()
+        .is_some_and(|expr| !expr.syntax().text_range().contains_range(range))
+    {
+        return Ok(None);
+    }
+    if let Some(name) = record_field_name_ref(&field) {
+        let matching_fields = places
+            .values()
+            .filter(|place| {
+                place.name == name.text().to_string()
+                    && matches!(place.kind, PlaceKind::Field { .. })
+            })
+            .collect::<Vec<_>>();
+        if matching_fields.len() == 1 {
+            return Ok(Some(matching_fields[0].id.clone()));
+        }
+        for definition in semantic.definitions_at(&file.path, name.syntax().text_range())? {
+            if let Some(place) = place_for_definition(places, &definition) {
+                if matches!(&places[&place].kind, PlaceKind::Field { .. }) {
+                    return Ok(Some(place));
+                }
+            }
         }
     }
     Ok(None)
@@ -1685,6 +2425,9 @@ fn flow_targets(
     if let Some(target) = assigned_place_target(file, range, places, semantic)? {
         targets.insert(target);
     }
+    if let Some(target) = record_field_target(file, range, places, semantic)? {
+        targets.insert(target);
+    }
     if let Some(target) = initializer_target(file, range, places, semantic)? {
         targets.insert(target);
     }
@@ -1731,6 +2474,40 @@ fn expression_place(
     let Some(name_ref) = name_ref else {
         return Ok(None);
     };
+    let name = name_ref.text().to_string();
+    match expression {
+        ast::Expr::FieldExpr(_) => {
+            let fields = places
+                .values()
+                .filter(|place| place.name == name && matches!(place.kind, PlaceKind::Field { .. }))
+                .collect::<Vec<_>>();
+            if fields.len() == 1 {
+                return Ok(Some(fields[0].id.clone()));
+            }
+        }
+        ast::Expr::PathExpr(_) => {
+            if let Some(owner) = expression.syntax().ancestors().find_map(ast::Fn::cast) {
+                let owner_range = owner.syntax().text_range();
+                let expression_range = expression.syntax().text_range();
+                let mut candidates = places
+                    .values()
+                    .filter(|place| {
+                        place.file == *file
+                            && place.name == name
+                            && place.name_range.start() < expression_range.start()
+                            && owner_range.contains_range(place.name_range)
+                            && matches!(place.kind, PlaceKind::Parameter { .. } | PlaceKind::Local)
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|place| place.name_range.start());
+                if let Some(place) = candidates.pop() {
+                    return Ok(Some(place.id.clone()));
+                }
+            }
+            return Ok(None);
+        }
+        _ => {}
+    }
     let Some(definition) = semantic.definition_at(file, name_ref.syntax().text_range())? else {
         return Ok(None);
     };
@@ -1757,6 +2534,15 @@ fn call_return_place(
     let Some(name_ref) = name_ref else {
         return Ok(None);
     };
+    let return_name = format!("{} return", name_ref.text());
+    let mut matching_returns = places.values().filter(|place| {
+        place.name == return_name && matches!(place.kind, PlaceKind::Return { .. })
+    });
+    if let Some(place) = matching_returns.next() {
+        if matching_returns.next().is_none() {
+            return Ok(Some(place.id.clone()));
+        }
+    }
     let Some(definition) = semantic.definition_at(file, name_ref.syntax().text_range())? else {
         return Ok(None);
     };
@@ -1768,8 +2554,7 @@ fn place_for_definition(
     definition: &SemanticDefinition,
 ) -> Option<String> {
     places
-        .values()
-        .find(|place| place.file == definition.file && place.name_range == definition.name_range)
+        .get(&place_id(&definition.file, definition.name_range))
         .map(|place| place.id.clone())
 }
 
@@ -1792,7 +2577,7 @@ fn collect_enum_info(
     enum_name: &str,
     enum_path: &str,
     files: &[ParsedFile],
-    semantic: &SemanticProject,
+    _semantic: &SemanticProject,
 ) -> std::result::Result<EnumInfo, FlowError> {
     let parsed = files
         .iter()
@@ -1840,6 +2625,7 @@ fn collect_enum_info(
             })
         })?;
     let mut variants = BTreeMap::new();
+    let mut variant_names = BTreeMap::new();
     let mut values = BTreeMap::new();
     for variant in enumeration
         .variant_list()
@@ -1851,6 +2637,7 @@ fn collect_enum_info(
             definition_key(enum_file, name.syntax().text_range()),
             name.text().to_string(),
         );
+        variant_names.insert(name.text().to_string(), name.text().to_string());
         if let Some(expr) = variant.const_arg().and_then(|argument| argument.expr()) {
             if let Some(value) = parse_integer(&expr.syntax().text().to_string(), &raw_type) {
                 values.insert(value, name.text().to_string());
@@ -1892,7 +2679,11 @@ fn collect_enum_info(
         }
     }
     let mut aliases = BTreeMap::new();
+    let mut aliases_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for file in files {
+        if !file.source.contains(enum_name) {
+            continue;
+        }
         for item in file
             .tree
             .syntax()
@@ -1906,6 +2697,10 @@ fn collect_enum_info(
                 continue;
             };
             if let Some(variant) = syntactic_to_raw_variant(&expr, enum_name) {
+                aliases_by_name
+                    .entry(name.text().to_string())
+                    .or_default()
+                    .push(variant.clone());
                 aliases.insert(
                     definition_key(&file.path, name.syntax().text_range()),
                     variant,
@@ -1913,15 +2708,23 @@ fn collect_enum_info(
             }
         }
     }
-    // Ensure rust-analyzer can resolve the enum itself before planning cross-file edits.
-    let enum_name_range = enumeration.name().unwrap().syntax().text_range();
-    let _ = semantic.references_to(enum_file, enum_name_range)?;
+    let alias_names = aliases_by_name
+        .into_iter()
+        .filter_map(|(name, variants)| {
+            variants
+                .iter()
+                .all(|variant| variant == &variants[0])
+                .then(|| (name, variants[0].clone()))
+        })
+        .collect();
     Ok(EnumInfo {
         name: enum_name.to_owned(),
         path: enum_path.to_owned(),
         raw_type,
         variants,
         aliases,
+        variant_names,
+        alias_names,
         values,
         from_raw,
         to_raw,
@@ -1934,6 +2737,9 @@ fn enum_variant(
     semantic: &SemanticProject,
     info: &EnumInfo,
 ) -> Result<Option<String>> {
+    if let Some(variant) = syntactic_enum_variant(expression, info) {
+        return Ok(Some(variant));
+    }
     let name_ref = match expression {
         ast::Expr::PathExpr(path) => path
             .path()
@@ -1957,6 +2763,33 @@ fn enum_variant(
     Ok(None)
 }
 
+fn syntactic_enum_variant(expression: &ast::Expr, info: &EnumInfo) -> Option<String> {
+    if let ast::Expr::PathExpr(path) = expression {
+        let name = path
+            .path()
+            .and_then(|path| path.segment())
+            .and_then(|segment| segment.name_ref())?
+            .text()
+            .to_string();
+        let path_text = expression.syntax().text().to_string();
+        if (path_text.contains(&format!("{}::", info.name))
+            || path_text.contains(&format!("{}::", info.path)))
+            && info.variant_names.contains_key(&name)
+        {
+            return info.variant_names.get(&name).cloned();
+        }
+        if let Some(variant) = info.alias_names.get(&name) {
+            return Some(variant.clone());
+        }
+    }
+    if let ast::Expr::Literal(literal) = expression {
+        if let Some(value) = parse_integer(&literal.syntax().text().to_string(), &info.raw_type) {
+            return info.values.get(&value).cloned();
+        }
+    }
+    None
+}
+
 fn enum_to_raw_receiver(
     expression: &ast::Expr,
     file: &Utf8PathBuf,
@@ -1972,15 +2805,22 @@ fn enum_to_raw_receiver(
     if name.text() != "to_raw" {
         return Ok(None);
     }
-    if !definition_matches(
-        semantic.definition_at(file, name.syntax().text_range())?,
-        info.to_raw.as_ref(),
-    ) {
+    let receiver = call.receiver();
+    let syntactic_enum_receiver = receiver.as_ref().is_some_and(|receiver| {
+        enum_variant(receiver, file, semantic, info)
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    if !syntactic_enum_receiver
+        && !definition_matches(
+            semantic.definition_at(file, name.syntax().text_range())?,
+            info.to_raw.as_ref(),
+        )
+    {
         return Ok(None);
     }
-    Ok(call
-        .receiver()
-        .map(|receiver| (receiver, name.syntax().text_range())))
+    Ok(receiver.map(|receiver| (receiver, name.syntax().text_range())))
 }
 
 fn enum_from_raw_call_at(
@@ -2000,11 +2840,15 @@ fn enum_from_raw_call_at(
         else {
             continue;
         };
+        let callee_text = callee.syntax().text().to_string();
+        let syntactic_enum_call = callee_text.ends_with(&format!("{}::from_raw", info.name))
+            || callee_text.ends_with(&format!("{}::from_raw", info.path));
         if name.text() == "from_raw"
-            && definition_matches(
-                semantic.definition_at(file, name.syntax().text_range())?,
-                info.from_raw.as_ref(),
-            )
+            && (syntactic_enum_call
+                || definition_matches(
+                    semantic.definition_at(file, name.syntax().text_range())?,
+                    info.from_raw.as_ref(),
+                ))
             && call.arg_list().is_some_and(|args| {
                 args.args().count() == 1
                     && args
@@ -2025,19 +2869,15 @@ fn enum_from_raw_call_at(
 fn enum_to_raw_call_at(
     parsed: &ParsedFile,
     range: TextRange,
-    file: &Utf8PathBuf,
-    semantic: &SemanticProject,
-    info: &EnumInfo,
+    _file: &Utf8PathBuf,
+    _semantic: &SemanticProject,
+    _info: &EnumInfo,
 ) -> Result<Option<ast::MethodCallExpr>> {
     for call in ancestors_at::<ast::MethodCallExpr>(parsed, range) {
         let Some(name) = call.name_ref() else {
             continue;
         };
         if name.text() == "to_raw"
-            && definition_matches(
-                semantic.definition_at(file, name.syntax().text_range())?,
-                info.to_raw.as_ref(),
-            )
             && call
                 .receiver()
                 .is_some_and(|receiver| receiver.syntax().text_range().contains_range(range))
@@ -2137,6 +2977,18 @@ fn collect_some_pattern_rewrites(
     info: &EnumInfo,
     replacements: &mut Vec<(TextRange, String)>,
 ) -> std::result::Result<(), FlowError> {
+    if let ast::Pat::OrPat(or) = pattern {
+        for child in or.pats() {
+            collect_some_pattern_rewrites(&child, info, replacements)?;
+        }
+        return Ok(());
+    }
+    if let ast::Pat::ParenPat(paren) = pattern {
+        if let Some(child) = paren.pat() {
+            collect_some_pattern_rewrites(&child, info, replacements)?;
+        }
+        return Ok(());
+    }
     let text = pattern.syntax().text().to_string();
     if let Some(inner) = text
         .trim()
@@ -2146,16 +2998,6 @@ fn collect_some_pattern_rewrites(
         if inner.contains(&info.name) {
             replacements.push((pattern.syntax().text_range(), inner.to_owned()));
             return Ok(());
-        }
-    }
-    if let ast::Pat::OrPat(or) = pattern {
-        for child in or.pats() {
-            collect_some_pattern_rewrites(&child, info, replacements)?;
-        }
-    }
-    if let ast::Pat::ParenPat(paren) = pattern {
-        if let Some(child) = paren.pat() {
-            collect_some_pattern_rewrites(&child, info, replacements)?;
         }
     }
     Ok(())
@@ -2213,6 +3055,26 @@ fn rewrite_direct_comparison(
     let (Some(lhs), Some(rhs)) = (binary.lhs(), binary.rhs()) else {
         return Ok(None);
     };
+    let syntactic_left = syntactic_enum_variant(&lhs, info);
+    let syntactic_right = syntactic_enum_variant(&rhs, info);
+    match (syntactic_left, syntactic_right) {
+        (Some(variant), None) => {
+            return Ok(Some(format!(
+                "{}::{variant} {operator} {}",
+                info.path,
+                slice_expr(&rhs)
+            )))
+        }
+        (None, Some(variant)) => {
+            return Ok(Some(format!(
+                "{} {operator} {}::{variant}",
+                slice_expr(&lhs),
+                info.path
+            )))
+        }
+        (Some(_), Some(_)) => return Ok(None),
+        (None, None) => {}
+    }
     let left = enum_variant(&lhs, file, semantic, info)?;
     let right = enum_variant(&rhs, file, semantic, info)?;
     match (left, right) {
@@ -2363,9 +3225,20 @@ fn reference_in_use(file: &ParsedFile, range: TextRange) -> bool {
 }
 fn is_record_field_name(file: &ParsedFile, range: TextRange) -> bool {
     ancestor_at::<ast::RecordExprField>(file, range).is_some_and(|field| {
-        field
-            .name_ref()
+        record_field_name_ref(&field)
             .is_some_and(|name| name.syntax().text_range().contains_range(range))
+    })
+}
+
+fn record_field_name_ref(field: &ast::RecordExprField) -> Option<ast::NameRef> {
+    field.name_ref().or_else(|| {
+        field.expr().and_then(|expression| match expression {
+            ast::Expr::PathExpr(path) => path
+                .path()
+                .and_then(|path| path.segment())
+                .and_then(|segment| segment.name_ref()),
+            _ => None,
+        })
     })
 }
 

@@ -37,6 +37,7 @@ pub struct CallSite {
     pub callee_range: TextRange,
     pub callee: String,
     pub args: Vec<String>,
+    pub arg_ranges: Vec<TextRange>,
     pub identifiers_in_file: BTreeSet<String>,
 }
 
@@ -318,6 +319,7 @@ fn collect_call_sites_impl(files: &[ParsedFile], include_identifiers: bool) -> V
     let mut calls = Vec::new();
 
     for file in files {
+        let first_call_for_file = calls.len();
         let identifiers_in_file = if include_identifiers {
             collect_identifiers(file)
         } else {
@@ -353,6 +355,10 @@ fn collect_call_sites_impl(files: &[ParsedFile], include_identifiers: bool) -> V
                             .to_owned()
                     })
                     .collect(),
+                arg_ranges: arg_list
+                    .args()
+                    .map(|arg| arg.syntax().text_range())
+                    .collect(),
                 identifiers_in_file: identifiers_in_file.clone(),
             });
         }
@@ -360,9 +366,8 @@ fn collect_call_sites_impl(files: &[ParsedFile], include_identifiers: bool) -> V
         // A macro's token tree is opaque to the Rust syntax parser. Scan its
         // tokens for ordinary call syntax so fast mode can rewrite calls in
         // assert_eq!, format!, and other expression macros as well.
-        let seen = calls
+        let seen = calls[first_call_for_file..]
             .iter()
-            .filter(|call| call.file == file.path)
             .map(|call| call.callee_range.start())
             .collect::<BTreeSet<_>>();
         for call in collect_macro_calls(file, &identifiers_in_file) {
@@ -411,6 +416,33 @@ fn macro_tokens(file: &ParsedFile) -> Vec<SyntaxToken> {
 
 fn collect_macro_calls(file: &ParsedFile, identifiers: &BTreeSet<String>) -> Vec<CallSite> {
     let tokens = macro_tokens(file);
+    collect_macro_calls_from_tokens(file, identifiers, &tokens)
+}
+
+pub(crate) fn macro_call_at(file: &ParsedFile, callee_range: TextRange) -> Option<CallSite> {
+    let token = file
+        .tree
+        .syntax()
+        .token_at_offset(callee_range.start())
+        .find(|token| token.text_range() == callee_range)?;
+    let macro_call = token.parent_ancestors().find_map(ast::MacroCall::cast)?;
+    let tree = macro_call.token_tree()?;
+    let tokens = tree
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !token.kind().is_trivia())
+        .collect::<Vec<_>>();
+    collect_macro_calls_from_tokens(file, &BTreeSet::new(), &tokens)
+        .into_iter()
+        .find(|call| call.callee_range == callee_range)
+}
+
+fn collect_macro_calls_from_tokens(
+    file: &ParsedFile,
+    identifiers: &BTreeSet<String>,
+    tokens: &[SyntaxToken],
+) -> Vec<CallSite> {
     let mut calls = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         if token.kind() != SyntaxKind::IDENT
@@ -430,6 +462,7 @@ fn collect_macro_calls(file: &ParsedFile, identifiers: &BTreeSet<String>) -> Vec
         let mut nesting = vec![")"];
         let mut arg_start = index + 2;
         let mut args = Vec::new();
+        let mut arg_ranges = Vec::new();
         let mut closing = None;
         for cursor in index + 2..tokens.len() {
             let current = tokens[cursor].text();
@@ -443,17 +476,12 @@ fn collect_macro_calls(file: &ParsedFile, identifiers: &BTreeSet<String>) -> Vec
                     }
                     if nesting.is_empty() {
                         if arg_start < cursor {
-                            args.push(
-                                source_for(
-                                    file,
-                                    TextRange::new(
-                                        tokens[arg_start].text_range().start(),
-                                        tokens[cursor - 1].text_range().end(),
-                                    ),
-                                )
-                                .trim()
-                                .to_owned(),
+                            let range = TextRange::new(
+                                tokens[arg_start].text_range().start(),
+                                tokens[cursor - 1].text_range().end(),
                             );
+                            args.push(source_for(file, range).trim().to_owned());
+                            arg_ranges.push(range);
                         }
                         closing = Some(cursor);
                         break;
@@ -461,17 +489,12 @@ fn collect_macro_calls(file: &ParsedFile, identifiers: &BTreeSet<String>) -> Vec
                 }
                 "," if nesting.len() == 1 => {
                     if arg_start < cursor {
-                        args.push(
-                            source_for(
-                                file,
-                                TextRange::new(
-                                    tokens[arg_start].text_range().start(),
-                                    tokens[cursor - 1].text_range().end(),
-                                ),
-                            )
-                            .trim()
-                            .to_owned(),
+                        let range = TextRange::new(
+                            tokens[arg_start].text_range().start(),
+                            tokens[cursor - 1].text_range().end(),
                         );
+                        args.push(source_for(file, range).trim().to_owned());
+                        arg_ranges.push(range);
                     }
                     arg_start = cursor + 1;
                 }
@@ -488,6 +511,7 @@ fn collect_macro_calls(file: &ParsedFile, identifiers: &BTreeSet<String>) -> Vec
             callee_range: token.text_range(),
             callee: token.text().to_owned(),
             args,
+            arg_ranges,
             identifiers_in_file: identifiers.clone(),
         });
     }

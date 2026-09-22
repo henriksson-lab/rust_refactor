@@ -300,20 +300,47 @@ literals become enum variants. An existing
 `let Some(value) = Mode::from_raw(raw) else { ... };` can remain as the single
 raw entry boundary while downstream calls become typed.
 
+Direct calls nested in expression macros such as `assert!` are included in the
+value flow. Other opaque macro references are refused when the tool cannot
+classify them.
+
 Propagation uses a work queue to a fixpoint: each selected or discovered
 parameter, field, local, or return value adds its producer places and consumer
 places until no new typed place is found. Cycles and multi-function chains are
-planned as one closure. Locals are discovered from simple identifier bindings;
-function returns support direct tail expressions and explicit `return`
-expressions. Unsupported destructuring, branch-valued expressions, and async
-returns refuse the atomic plan.
+planned as one closure. A constructor parameter or local stored in a named
+field automatically brings that field into the closure; both `Struct { field }`
+shorthand and `Struct { field: value }` are supported. Locals are discovered
+from simple identifier bindings; function returns support direct tail
+expressions and explicit `return` expressions. Unsupported destructuring,
+branch-valued expressions, and async returns refuse the atomic plan.
 
 The plan is atomic. It refuses function-value references, unknown argument or
-field producers, compound field writes, macro references, explicit observation
-of `None` in a converted match, conflicting edits, and plans that do not reduce
-the number of conversions. `--write` snapshots touched files, runs rustfmt and
-`cargo check`, and restores every file when verification fails. No forwarding
-wrappers are generated.
+field producers, compound field writes, unresolved macro references, explicit
+observation of `None` in a converted match, conflicting edits, and plans that
+do not reduce the number of conversions. `--write` snapshots touched files,
+runs rustfmt and `cargo check`, and restores every file when verification
+fails. No forwarding wrappers are generated.
+
+Workspace syntax, definitions, references, and call sites are indexed once per
+invocation. Fixpoint propagation then examines references with matching names
+and the connected value-flow edges rather than rescanning the workspace for
+each discovered place. Set `RUST_REFACTOR_TIMING=1` to print phase timings to
+standard error when diagnosing a slow project.
+
+Compatibility constants are temporary migration names. Remove them after
+hoisting, replacing every remaining raw use with `Enum::Variant.to_raw()`:
+
+```sh
+./target/debug/rust-refactor enum-hoist \
+  --manifest-path /path/to/Cargo.toml \
+  --enum-file src/modes.rs --enum-name Mode \
+  --remove-aliases --write --format json
+```
+
+The cleanup also rewrites grouped imports. Batch several enums through one
+workspace analysis by repeating `--remove-aliases-from FILE=ENUM`; the primary
+enum is selected by `--enum-file`, `--enum-name`, and `--remove-aliases`. Alias
+cleanup can run without a parameter, field, local, or return seed.
 
 Use repeated `--comparison FILE:LINE:COLUMN` selections for `==` and `!=`
 expressions. A selected `raw == MODE_BYTE` becomes

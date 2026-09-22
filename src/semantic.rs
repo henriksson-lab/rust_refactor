@@ -1,3 +1,5 @@
+use std::{cell::RefCell, collections::BTreeMap, time::Instant};
+
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use ra_ap_ide::{
@@ -27,6 +29,8 @@ pub struct SemanticDefinition {
 pub struct SemanticProject {
     _host: AnalysisHost,
     vfs: Vfs,
+    reference_cache: RefCell<BTreeMap<(Utf8PathBuf, u32, u32), Vec<SemanticReference>>>,
+    definition_cache: RefCell<BTreeMap<(Utf8PathBuf, u32, u32), Vec<SemanticDefinition>>>,
 }
 
 impl SemanticProject {
@@ -35,12 +39,13 @@ impl SemanticProject {
     }
 
     pub fn load_with(project: &Project, all_features: bool, target: Option<&str>) -> Result<Self> {
+        let started = Instant::now();
         let manifest = AbsPathBuf::assert_utf8(project.manifest_path.clone().into_std_path_buf());
         let manifest = ProjectManifest::from_manifest_file(manifest)
             .context("failed to create rust-analyzer project manifest")?;
         let cargo_config = CargoConfig {
-            all_targets: true,
-            set_test: true,
+            all_targets: false,
+            set_test: false,
             features: if all_features {
                 CargoFeatures::All
             } else {
@@ -58,13 +63,18 @@ impl SemanticProject {
         };
         let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {})
             .context("failed to load rust-analyzer project workspace")?;
+        report_timing("semantic workspace metadata", started);
+        let started = Instant::now();
         let (db, vfs, _proc_macro) =
             ra_ap_load_cargo::load_workspace(workspace, &cargo_config.extra_env, &load_config)
                 .context("failed to load workspace into rust-analyzer database")?;
+        report_timing("semantic workspace load", started);
 
         Ok(Self {
             _host: AnalysisHost::with_database(db),
             vfs,
+            reference_cache: RefCell::new(BTreeMap::new()),
+            definition_cache: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -84,6 +94,14 @@ impl SemanticProject {
         file: &Utf8Path,
         name_range: TextRange,
     ) -> Result<Vec<SemanticReference>> {
+        let cache_key = (
+            file.to_owned(),
+            name_range.start().into(),
+            name_range.end().into(),
+        );
+        if let Some(references) = self.reference_cache.borrow().get(&cache_key) {
+            return Ok(references.clone());
+        }
         let file_id = self
             .file_id(file)
             .with_context(|| format!("rust-analyzer VFS does not contain {file}"))?;
@@ -123,6 +141,9 @@ impl SemanticProject {
             }
         }
 
+        self.reference_cache
+            .borrow_mut()
+            .insert(cache_key, references.clone());
         Ok(references)
     }
 
@@ -131,6 +152,19 @@ impl SemanticProject {
         file: &Utf8Path,
         range: TextRange,
     ) -> Result<Option<SemanticDefinition>> {
+        let mut definitions = self.definitions_at(file, range)?;
+        Ok((definitions.len() == 1).then(|| definitions.remove(0)))
+    }
+
+    pub fn definitions_at(
+        &self,
+        file: &Utf8Path,
+        range: TextRange,
+    ) -> Result<Vec<SemanticDefinition>> {
+        let cache_key = (file.to_owned(), range.start().into(), range.end().into());
+        if let Some(definitions) = self.definition_cache.borrow().get(&cache_key) {
+            return Ok(definitions.clone());
+        }
         let file_id = self
             .file_id(file)
             .with_context(|| format!("rust-analyzer VFS does not contain {file}"))?;
@@ -145,23 +179,20 @@ impl SemanticProject {
             .analysis()
             .goto_definition(position, &config)
             .context("rust-analyzer definition lookup was cancelled")?;
-        let Some(targets) = targets else {
-            return Ok(None);
-        };
-        if targets.info.len() != 1 {
-            return Ok(None);
-        }
-        let target = &targets.info[0];
-        let Some(path) = self.file_path(target.file_id) else {
-            return Ok(None);
-        };
-        let Some(name_range) = target.focus_range else {
-            return Ok(None);
-        };
-        Ok(Some(SemanticDefinition {
-            file: path,
-            name_range,
-        }))
+        let definitions = targets
+            .into_iter()
+            .flat_map(|targets| targets.info)
+            .filter_map(|target| {
+                Some(SemanticDefinition {
+                    file: self.file_path(target.file_id)?,
+                    name_range: target.focus_range?,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.definition_cache
+            .borrow_mut()
+            .insert(cache_key, definitions.clone());
+        Ok(definitions)
     }
 
     fn file_path(&self, file_id: FileId) -> Option<Utf8PathBuf> {
@@ -169,6 +200,15 @@ impl SemanticProject {
             .file_path(file_id)
             .as_path()
             .map(|path| Utf8PathBuf::from(<_ as AsRef<Utf8Path>>::as_ref(path)))
+    }
+}
+
+fn report_timing(label: &str, started: Instant) {
+    if std::env::var_os("RUST_REFACTOR_TIMING").is_some() {
+        eprintln!(
+            "rust-refactor timing: {label}: {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
     }
 }
 
